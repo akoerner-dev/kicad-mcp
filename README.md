@@ -163,10 +163,12 @@ Verify a build end to end (stdio + HTTP handshake) with `docker/smoke-test.sh`.
 After a PCM install, the server binary lives in your KiCAD documents folder:
 
 ```
-C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_mixelpixx_konnect\bin\konnect.exe
+Windows: C:\Users\<YOU>\Documents\KiCad\10.0\3rdparty\plugins\com_github_mixelpixx_konnect\bin\konnect.exe
+macOS:   ~/Documents/KiCad/10.0/3rdparty/plugins/com_github_mixelpixx_konnect/bin/konnect
 ```
 
-Edit `%APPDATA%\Claude\claude_desktop_config.json`:
+Edit your Claude Desktop config — `%APPDATA%\Claude\claude_desktop_config.json` on
+Windows, `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS:
 
 ```json
 {
@@ -178,15 +180,31 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json`:
 }
 ```
 
+(On macOS use the plain path, e.g.
+`/Users/<YOU>/Documents/KiCad/10.0/3rdparty/plugins/com_github_mixelpixx_konnect/bin/konnect`.)
+
 Restart Claude Desktop and the Konnect tools appear. For Claude Code, drop the same
 snippet into a `.mcp.json` in your project root (see [examples/](examples/)).
+
+### macOS notes
+
+- `kicad-cli`, the KiCAD binary, and the stock symbol libraries are auto-discovered
+  inside `/Applications/KiCad/KiCad.app` — no config needed for a standard install.
+- If you install a downloaded release zip (rather than building locally), macOS
+  Gatekeeper may quarantine the binary. Clear it with:
+  `xattr -d com.apple.quarantine ~/Documents/KiCad/10.0/3rdparty/plugins/com_github_mixelpixx_konnect/bin/konnect`
+- If the server won't start, check the binary kept its execute bit after
+  extraction: `chmod +x .../bin/konnect`.
+- For the PCB tools, enable **KiCAD → Preferences → Plugins → Enable KiCad API**;
+  Konnect then connects to KiCAD's default socket (`/tmp/kicad/api.sock`)
+  automatically while KiCAD is running.
 
 ## Schematic viewer
 
 A standalone viewer that auto-refreshes as the schematic file changes:
 
 ```bash
-schematic-viewer.exe path\to\your\root_schematic.kicad_sch
+schematic-viewer path/to/your/root_schematic.kicad_sch   # schematic-viewer.exe on Windows
 ```
 
 Point it at the root sheet of a hierarchical design and every sub-sheet is rendered
@@ -197,13 +215,14 @@ viewer never blocks KiCAD from saving. Pan with click-drag, zoom with the wheel,
 `0` to fit, `R` to refresh, drag-and-drop to open a different file. Also launchable
 by the AI via the `open_schematic_viewer` tool.
 
-Needs the WebView2 runtime (pre-installed on Windows 10/11) and a KiCAD install for
-`kicad-cli` (auto-discovered, or pass `--kicad-cli <path>`). Built separately from
-the main workspace — see [DEV.md](DEV.md) for build steps.
+Uses the system webview (WebView2 on Windows, pre-installed on 10/11; WKWebView on
+macOS) and needs a KiCAD install for `kicad-cli` (auto-discovered, or pass
+`--kicad-cli <path>`). Built separately from the main workspace — see
+[DEV.md](DEV.md) for build steps.
 
 ## Requirements
 
-- KiCAD 10 (Windows today; Linux and macOS builds are on the [roadmap](ROADMAP.md) —
+- KiCAD 10 on Windows or macOS (Linux builds are on the [roadmap](ROADMAP.md) —
   the code already compiles and passes tests on all three platforms in CI)
 - `kicad-cli` (ships with KiCAD — used for exports, ERC, DRC)
 - For PCB tools: KiCAD running with the target board open (IPC API)

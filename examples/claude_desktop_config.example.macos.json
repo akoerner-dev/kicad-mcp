@@ -1,0 +1,19 @@
+{
+  "_comment_1": "Copy the contents of this into ~/Library/Application Support/Claude/claude_desktop_config.json.",
+  "_comment_2": "If you already have mcpServers, merge the 'konnect' entry into your existing object.",
+  "_comment_3": "Substitute <YOU> with your macOS username.",
+  "_comment_4": "The --config arg is optional — Konnect works with defaults out of the box.",
+
+  "mcpServers": {
+    "konnect": {
+      "command": "/Users/<YOU>/Documents/KiCad/10.0/3rdparty/plugins/com_github_mixelpixx_konnect/bin/konnect",
+      "args": [
+        "--config",
+        "/Users/<YOU>/konnect-settings.json"
+      ],
+      "env": {
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}

@@ -67,11 +67,12 @@ pub struct KiCadIpcClient {
 
 impl KiCadIpcClient {
     /// Create a client connecting to the given IPC socket path.
-    /// If empty, tries KICAD_API_SOCKET environment variable.
+    /// If empty, tries the KICAD_API_SOCKET environment variable, then (on
+    /// Unix) KiCAD's default socket path if it currently exists.
     pub fn new(socket_path: impl Into<String>) -> Self {
         let path = socket_path.into();
         let effective_path = if path.is_empty() {
-            std::env::var("KICAD_API_SOCKET").unwrap_or_default()
+            std::env::var("KICAD_API_SOCKET").unwrap_or_else(|_| Self::default_unix_socket())
         } else {
             path
         };
@@ -79,6 +80,20 @@ impl KiCadIpcClient {
             socket_path: effective_path,
             client_name: format!("konnect-{}", std::process::id()),
         }
+    }
+
+    /// KiCAD's default API socket on macOS/Linux, existence-gated so the
+    /// "IPC not configured" guidance still fires when KiCAD isn't running
+    /// or its API server is disabled.
+    fn default_unix_socket() -> String {
+        #[cfg(unix)]
+        {
+            let default = "/tmp/kicad/api.sock";
+            if std::path::Path::new(default).exists() {
+                return format!("ipc://{default}");
+            }
+        }
+        String::new()
     }
 
     /// Send a protobuf command and return the response Any.

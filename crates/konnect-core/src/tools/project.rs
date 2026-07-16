@@ -332,8 +332,8 @@ async fn handle_open_viewer(
             }
         }
         None => Ok(CallToolResult::error(
-            "Schematic viewer binary (schematic-viewer.exe) not found. \
-             It should be in the same directory as konnect.exe.",
+            "Schematic viewer binary (schematic-viewer) not found. \
+             It should be in the same directory as the konnect binary.",
         )),
     }
 }

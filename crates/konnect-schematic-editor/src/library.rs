@@ -217,7 +217,22 @@ pub fn find_symbol_dirs() -> Vec<PathBuf> {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let candidates = [
+            "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
+            "/Applications/KiCad.app/Contents/SharedSupport/symbols",
+            "/usr/local/share/kicad/symbols",
+        ];
+        for c in &candidates {
+            let p = PathBuf::from(c);
+            if p.is_dir() && !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let candidates = ["/usr/share/kicad/symbols", "/usr/local/share/kicad/symbols"];
         for c in &candidates {

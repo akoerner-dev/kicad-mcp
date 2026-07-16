@@ -51,7 +51,9 @@ fn default_kicad_cli() -> String {
     if cfg!(target_os = "windows") {
         "kicad-cli.exe".to_string()
     } else {
-        "kicad-cli".to_string()
+        // On macOS the CLI lives inside the app bundle, which is never on the
+        // PATH that GUI-launched MCP clients (e.g. Claude Desktop) inherit.
+        first_existing_macos_binary("kicad-cli").unwrap_or_else(|| "kicad-cli".to_string())
     }
 }
 
@@ -59,8 +61,32 @@ fn default_kicad_binary() -> String {
     if cfg!(target_os = "windows") {
         "kicad.exe".to_string()
     } else {
-        "kicad".to_string()
+        first_existing_macos_binary("kicad").unwrap_or_else(|| "kicad".to_string())
     }
+}
+
+/// On macOS, return the first existing app-bundle path for the given KiCAD
+/// binary name. Returns None on other platforms or when no bundle is found.
+fn first_existing_macos_binary(name: &str) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let mut candidates = vec![
+        format!("/Applications/KiCad/KiCad.app/Contents/MacOS/{name}"),
+        format!("/Applications/KiCad.app/Contents/MacOS/{name}"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy();
+        candidates.push(format!(
+            "{home}/Applications/KiCad/KiCad.app/Contents/MacOS/{name}"
+        ));
+        candidates.push(format!(
+            "{home}/Applications/KiCad.app/Contents/MacOS/{name}"
+        ));
+    }
+    candidates
+        .into_iter()
+        .find(|c| std::path::Path::new(c).exists())
 }
 
 fn default_ipc_address() -> String {
@@ -174,6 +200,21 @@ mod tests {
 
     // Malformed input must produce Err, never a panic (the class of bug
     // PR #9 found in the config *tools*; this pins the server config too).
+
+    // Only asserts when a KiCAD app bundle is actually installed, so CI
+    // runners without KiCAD still pass.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn default_kicad_cli_prefers_app_bundle_when_present() {
+        let bundle = "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli";
+        if std::path::Path::new(bundle).exists() {
+            assert_eq!(default_kicad_cli(), bundle);
+            assert_eq!(
+                default_kicad_binary(),
+                "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad"
+            );
+        }
+    }
 
     #[test]
     fn json_non_object_root_is_err_not_panic() {

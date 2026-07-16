@@ -11,7 +11,7 @@
 use crate::manifest::{AGENTS, HOOK_SKILLS, SKILLS};
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -273,7 +273,14 @@ pub fn run_double_click_install() -> Result<()> {
     println!(r#"  }}"#);
 
     println!("\nConfig locations:");
-    println!("  Claude Desktop: %APPDATA%\\Claude\\claude_desktop_config.json");
+    let desktop_config = if cfg!(target_os = "windows") {
+        "%APPDATA%\\Claude\\claude_desktop_config.json"
+    } else if cfg!(target_os = "macos") {
+        "~/Library/Application Support/Claude/claude_desktop_config.json"
+    } else {
+        "~/.config/Claude/claude_desktop_config.json"
+    };
+    println!("  Claude Desktop: {desktop_config}");
     println!("  Claude Code:    .mcp.json in your project root");
     println!("\nAfter editing the config, restart Claude.\n");
 
@@ -397,29 +404,62 @@ fn remove_hooks_from_settings() -> Result<()> {
     Ok(())
 }
 
-/// Auto-detect KiCAD installation on Windows.
-/// Checks registry and standard paths for kicad-cli.exe.
+/// Auto-detect a KiCAD installation.
+/// Checks standard per-platform paths for kicad-cli (plus the registry on Windows).
 pub fn detect_kicad() -> Option<PathBuf> {
-    // Standard paths (check these first — faster than registry)
-    let standard_paths = [
-        r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe",
-        r"C:\Program Files (x86)\KiCad\10.0\bin\kicad-cli.exe",
-        r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe",
-        r"C:\Program Files (x86)\KiCad\9.0\bin\kicad-cli.exe",
-    ];
+    #[cfg(target_os = "windows")]
+    {
+        // Standard paths (check these first — faster than registry)
+        let standard_paths = [
+            r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe",
+            r"C:\Program Files (x86)\KiCad\10.0\bin\kicad-cli.exe",
+            r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe",
+            r"C:\Program Files (x86)\KiCad\9.0\bin\kicad-cli.exe",
+        ];
 
-    for path_str in &standard_paths {
-        let path = Path::new(path_str);
-        if path.exists() {
-            return Some(path.to_path_buf());
+        for path_str in &standard_paths {
+            let path = std::path::Path::new(path_str);
+            if path.exists() {
+                return Some(path.to_path_buf());
+            }
+        }
+
+        if let Some(path) = detect_kicad_from_registry() {
+            return Some(path);
         }
     }
 
-    // Try registry on Windows
-    #[cfg(target_os = "windows")]
+    #[cfg(target_os = "macos")]
     {
-        if let Some(path) = detect_kicad_from_registry() {
-            return Some(path);
+        // App bundles are not versioned in the path, so these cover both the
+        // official DMG and homebrew-cask installs of KiCAD 9 and 10.
+        let mut candidates = vec![
+            PathBuf::from("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"),
+            PathBuf::from("/Applications/KiCad.app/Contents/MacOS/kicad-cli"),
+        ];
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join("Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"));
+            candidates.push(home.join("Applications/KiCad.app/Contents/MacOS/kicad-cli"));
+        }
+        for path in candidates {
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let candidates = [
+            "/usr/bin/kicad-cli",
+            "/usr/local/bin/kicad-cli",
+            "/usr/lib/kicad/bin/kicad-cli",
+        ];
+        for path_str in &candidates {
+            let path = std::path::Path::new(path_str);
+            if path.exists() {
+                return Some(path.to_path_buf());
+            }
         }
     }
 
@@ -442,7 +482,9 @@ fn detect_kicad_from_registry() -> Option<PathBuf> {
         for line in stdout.lines() {
             if line.contains("REG_SZ") {
                 let path_str = line.split("REG_SZ").last()?.trim();
-                let cli_path = Path::new(path_str).join("bin").join("kicad-cli.exe");
+                let cli_path = std::path::Path::new(path_str)
+                    .join("bin")
+                    .join("kicad-cli.exe");
                 if cli_path.exists() {
                     return Some(cli_path);
                 }
