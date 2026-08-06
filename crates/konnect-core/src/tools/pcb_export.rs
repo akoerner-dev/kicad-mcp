@@ -286,6 +286,11 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "output": { "type": "string", "description": "Optional path to write DRC report JSON" },
+                    "schematic_parity": {
+                        "type": "boolean",
+                        "description": "Also run board-vs-schematic parity (--schematic-parity). Requires the sibling .kicad_sch. Default false.",
+                        "default": false
+                    },
                     "severity": {
                         "type": "string",
                         "description": "Minimum severity to include: 'error', 'warning' (default), 'info'",
@@ -645,7 +650,8 @@ async fn handle_get_drc_violations(
 
     let cli = &ctx.config.kicad_cli;
     let refill = args["refill_zones"].as_bool().unwrap_or(false);
-    let violations = cli::run_drc(cli, &board, refill).await?;
+    let parity = args["schematic_parity"].as_bool().unwrap_or(false);
+    let violations = cli::run_drc(cli, &board, refill, parity).await?;
 
     // Optionally write report
     if let Some(out_path) = args["output"].as_str() {
@@ -661,9 +667,13 @@ async fn handle_get_drc_violations(
     let summary = json!({
         "total": violations.len(),
         "filtered_count": filtered.len(),
+        "unconnected": filtered.iter().filter(|v| v.kind == "unconnected").count(),
+        "parity": filtered.iter().filter(|v| v.kind == "parity").count(),
+        "schematic_parity_checked": parity,
         "severity_filter": severity_filter,
         "violations": filtered.iter().map(|v| json!({
             "severity": v.severity,
+            "kind": v.kind,
             "description": v.description,
             "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y }))
         })).collect::<Vec<_>>()

@@ -40,6 +40,10 @@ pub struct ErcPos {
 pub struct DrcViolation {
     pub severity: String,
     pub description: String,
+    /// Which report section this came from: "rule" (geometric/clearance),
+    /// "unconnected" (ratsnest / copper connectivity) or "parity"
+    /// (board-vs-schematic netlist mismatch).
+    pub kind: String,
     pub pos: Option<ErcPos>,
 }
 
@@ -134,9 +138,25 @@ fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
 
 // ─── DRC ─────────────────────────────────────────────────────────────────────
 
-/// Run DRC on a PCB and return parsed violations.
-/// KiCAD 10: `pcb drc --output <path> --format json [--refill-zones] <input>`
-pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<DrcViolation>> {
+/// Run DRC on a PCB and return parsed violations from ALL report sections.
+///
+/// KiCAD 10 emits three arrays in the JSON report: `violations` (geometric /
+/// clearance rules), `unconnected_items` (ratsnest / copper connectivity) and
+/// `schematic_parity` (board-vs-schematic netlist mismatch). The stock tool
+/// only read `violations`; we fold in the other two so callers can assert
+/// "0 unconnected, parity clean" (the MVP acceptance criterion).
+///
+/// `unconnected_items` is always present in the report; `schematic_parity` is
+/// only populated when `--schematic-parity` is passed, which requires the
+/// sibling `.kicad_sch` next to the board.
+///
+/// `pcb drc --output <path> --format json [--schematic-parity] [--refill-zones] <input>`
+pub async fn run_drc(
+    cli: &str,
+    pcb: &Path,
+    refill_zones: bool,
+    schematic_parity: bool,
+) -> Result<Vec<DrcViolation>> {
     let out_path = pcb.with_extension("drc.json");
     let mut args = vec![
         "pcb",
@@ -146,6 +166,9 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<Dr
         "--format",
         "json",
     ];
+    if schematic_parity {
+        args.push("--schematic-parity");
+    }
     if refill_zones {
         args.push("--refill-zones");
     }
@@ -158,22 +181,45 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<Dr
     let raw: serde_json::Value = serde_json::from_str(&json_str)?;
     let _ = tokio::fs::remove_file(&out_path).await;
 
-    Ok(raw
-        .get("violations")
-        .and_then(|v| v.as_array())
-        .unwrap_or(&vec![])
-        .iter()
-        .map(|v| DrcViolation {
-            severity: v["severity"].as_str().unwrap_or("error").to_string(),
+    let mut out = Vec::new();
+    // Geometric / clearance rules — severity is carried in the report.
+    parse_drc_section(&raw, "violations", "rule", "error", &mut out);
+    // Connectivity — unconnected ratsnest ends; KiCAD treats these as errors.
+    parse_drc_section(&raw, "unconnected_items", "unconnected", "error", &mut out);
+    // Board-vs-schematic parity — only present when --schematic-parity was set.
+    parse_drc_section(&raw, "schematic_parity", "parity", "error", &mut out);
+    Ok(out)
+}
+
+/// Fold one section of the kicad-cli DRC JSON report into `out`, tagging each
+/// entry with `kind` and falling back to `default_severity` when the report
+/// omits a severity (unconnected/parity entries sometimes do).
+fn parse_drc_section(
+    raw: &serde_json::Value,
+    section: &str,
+    kind: &str,
+    default_severity: &str,
+    out: &mut Vec<DrcViolation>,
+) {
+    let Some(arr) = raw.get(section).and_then(|v| v.as_array()) else {
+        return;
+    };
+    for v in arr {
+        out.push(DrcViolation {
+            severity: v["severity"]
+                .as_str()
+                .unwrap_or(default_severity)
+                .to_string(),
             description: v["description"].as_str().unwrap_or("").to_string(),
+            kind: kind.to_string(),
             pos: v.get("pos").and_then(|p| {
                 Some(ErcPos {
                     x: p["x"].as_f64()?,
                     y: p["y"].as_f64()?,
                 })
             }),
-        })
-        .collect())
+        });
+    }
 }
 
 // ─── Annotation ───────────────────────────────────────────────────────────────
