@@ -596,3 +596,44 @@ pub async fn render_pcb_png(cli: &str, pcb: &Path, output: &Path, layers: &[&str
     run_cli(cli, &args, LONG_TIMEOUT).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod live_drc_tests {
+    use super::*;
+
+    /// Live end-to-end check of the patched DRC path against a real board.
+    /// Skipped unless TEST_PCB (and optionally KICAD_CLI) env vars are set, so
+    /// the normal `cargo test` run stays green without KiCAD installed.
+    #[tokio::test]
+    async fn live_drc_captures_unconnected_and_parity() {
+        let Ok(pcb) = std::env::var("TEST_PCB") else {
+            eprintln!("SKIP: set TEST_PCB to run the live DRC test");
+            return;
+        };
+        let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+        let board = std::path::PathBuf::from(pcb);
+
+        let all = run_drc(&cli, &board, false, true)
+            .await
+            .expect("run_drc with schematic_parity should succeed");
+
+        let count = |k: &str| all.iter().filter(|v| v.kind == k).count();
+        let (rule, unconn, parity) = (count("rule"), count("unconnected"), count("parity"));
+        eprintln!(
+            "LIVE DRC: total={} | rule={} unconnected={} parity={}",
+            all.len(),
+            rule,
+            unconn,
+            parity
+        );
+        for v in &all {
+            eprintln!("  [{}/{}] {}", v.kind, v.severity, v.description);
+        }
+
+        // The whole point of the patch: the two sections the stock tool dropped
+        // must now be present. (This board is known to have both.)
+        assert!(unconn > 0, "expected unconnected_items to be captured");
+        assert!(parity > 0, "expected schematic_parity to be captured");
+        assert_eq!(all.len(), rule + unconn + parity, "every entry must be tagged");
+    }
+}
