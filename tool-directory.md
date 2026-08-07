@@ -198,7 +198,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
-### `pcb_components` · 13 tools
+### `pcb_components` · 14 tools
 **Purpose:** Place, move, rotate, align, and duplicate PCB footprints.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
@@ -212,6 +212,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `find_component` | Find a footprint by reference designator and return its position. |
 | `get_component_pads` | Return pad positions and net assignments for a footprint. |
 | `get_pad_position` | Return the schematic-space position of a specific pad number on a footprint. |
+| `set_pad_net` | Reassign the net of a single pad by rewriting its `(net ...)` entry (S-expression edit; format-preserving, no IPC). Fixes a stale/swapped pad-net without the GUI. |
 | `get_component_list` | List all footprints on the board with positions, layers, and values. |
 | `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
 | `align_components` | Align multiple footprints along a common X or Y axis via KiCAD IPC. |

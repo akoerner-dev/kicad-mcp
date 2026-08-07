@@ -8,6 +8,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::client::KiCadIpcClient;
+use konnect_sexp::writer::{apply_edits, find_balanced_block, write_atomic, SexpEdit};
 use serde_json::json;
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
@@ -156,6 +157,21 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference", "pad_number"]
             }),
             |args, ctx| async move { handle_get_pad_position(args, ctx).await }
+        ),
+        tool!(
+            "set_pad_net",
+            "Reassign the net of a single pad on a footprint by rewriting the pad's (net ...) entry directly in the .kicad_pcb (S-expression edit, no KiCAD IPC required). The target net must already exist in the board's net table. Fixes a stale/swapped pad-net assignment — the file-level effect of 'Update PCB from Schematic' for one pad — without the GUI. Does NOT move copper: traces touching the pad keep their own net, so re-run DRC afterwards. If KiCAD has the board open, revert/reload it to see the change.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string" },
+                    "reference": { "type": "string", "description": "Reference designator, e.g. 'U1'" },
+                    "pad":       { "type": "string", "description": "Pad number/name as written in the footprint, e.g. '1'" },
+                    "net_name":  { "type": "string", "description": "Target net name; must already exist in the board's net table (see get_nets_list / add_net)" }
+                },
+                "required": ["board", "reference", "pad", "net_name"]
+            }),
+            |args, ctx| async move { handle_set_pad_net(args, ctx).await }
         ),
         tool!(
             "get_component_list",
@@ -462,6 +478,161 @@ async fn handle_get_pad_position(
         "Pad '{}' not found",
         pad_number
     )))
+}
+
+async fn handle_set_pad_net(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let pad_number = match require_str(args, "pad") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let net_name = match require_str(args, "net_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+
+    let content = std::fs::read_to_string(&board_path)?;
+
+    // Resolve the target net's numeric code from the board's top-level net table,
+    // if the file uses coded nets at all. `find_all` is non-recursive, so this
+    // only sees the top-level `(net code "name")` declarations, not pad nets.
+    // Some boards store nets by name only — `(net "name")` with no code — in which
+    // case this stays None and we mirror that name-only format below.
+    let tree = konnect_sexp::parser::parse_sexp(&content)?;
+    let top_nets = tree.find_all("net");
+    let file_uses_codes = top_nets.iter().any(|n| n.get(2).is_some());
+    let net_code = top_nets
+        .iter()
+        .find(|n| n.get(2).and_then(|x| x.as_str()) == Some(net_name.as_str()))
+        .and_then(|n| n.get(1))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+
+    // 2. Locate the footprint block via its Reference property, then the
+    //    enclosing `(footprint ...)`. The trailing quote in the pattern keeps
+    //    'U1' from matching 'U10'.
+    let ref_pat = format!("(property \"Reference\" \"{}\"", reference);
+    let ref_pos = match content.find(&ref_pat) {
+        Some(p) => p,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Footprint '{}' not found",
+                reference
+            )))
+        }
+    };
+    let fp_open = match content[..ref_pos].rfind("(footprint ") {
+        Some(p) => p,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Could not locate the footprint block enclosing '{}'",
+                reference
+            )))
+        }
+    };
+    let (fp_start, fp_end) = match find_balanced_block(&content, fp_open) {
+        Some(r) => r,
+        None => return Ok(CallToolResult::error("Unbalanced footprint block".to_string())),
+    };
+
+    // 3. Locate the target pad within that footprint. Trailing space keeps
+    //    '1' from matching '10'.
+    let pad_pat = format!("(pad \"{}\" ", pad_number);
+    let pad_pos = match content[fp_start..fp_end].find(&pad_pat) {
+        Some(p) => fp_start + p,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Pad '{}' not found on footprint '{}'",
+                pad_number, reference
+            )))
+        }
+    };
+    let (pad_start, pad_end) = match find_balanced_block(&content, pad_pos) {
+        Some(r) => r,
+        None => return Ok(CallToolResult::error("Unbalanced pad block".to_string())),
+    };
+
+    // 4. Replace the pad's existing `(net ...)` node (or insert one), mirroring
+    //    the file's net format: coded `(net <code> "name")` or name-only
+    //    `(net "name")`.
+    let existing = match content[pad_start..pad_end].find("(net ") {
+        Some(net_rel) => {
+            let net_abs = pad_start + net_rel;
+            match find_balanced_block(&content, net_abs) {
+                Some((ns, ne)) => Some((ns, ne, content[ns..ne].to_string())),
+                None => {
+                    return Ok(CallToolResult::error(
+                        "Unbalanced (net ...) block on pad".to_string(),
+                    ))
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Does this pad's net (or, absent one, the file) carry a numeric code?
+    let coded = match &existing {
+        Some((_, _, old)) => old
+            .trim_start()
+            .trim_start_matches("(net")
+            .trim_start()
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit()),
+        None => file_uses_codes,
+    };
+
+    let new_net = if coded {
+        match &net_code {
+            Some(code) => format!("(net {code} \"{net_name}\")"),
+            None => {
+                return Ok(CallToolResult::error(format!(
+                    "Net '{net_name}' is not in the board's net table, so it has no net code. Add it first (add_net) or check the name."
+                )))
+            }
+        }
+    } else {
+        format!("(net \"{net_name}\")")
+    };
+
+    let (edit, old_net) = match existing {
+        Some((net_start, net_end, old)) => {
+            if old == new_net {
+                return Ok(CallToolResult::json(&json!({
+                    "reference": reference,
+                    "pad": pad_number,
+                    "net_name": net_name,
+                    "unchanged": true,
+                    "note": "Pad already assigned to this net."
+                })));
+            }
+            (
+                SexpEdit::replace(net_start, net_end, new_net.clone()),
+                Some(old),
+            )
+        }
+        // Pad currently has no net: insert one just before its closing paren.
+        None => (SexpEdit::insert(pad_end - 1, format!(" {new_net}")), None),
+    };
+
+    let new_content = apply_edits(content, vec![edit]);
+    write_atomic(&board_path, &new_content)?;
+
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "pad": pad_number,
+        "net_name": net_name,
+        "net_code": net_code,
+        "old_net": old_net,
+        "note": "Pad net rewritten in the .kicad_pcb. Copper was not moved — re-run DRC to verify. If KiCAD has the board open, revert/reload it to see the change."
+    })))
 }
 
 async fn handle_get_component_list(
