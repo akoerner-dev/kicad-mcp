@@ -6,6 +6,7 @@ pub mod design_review;
 pub mod integration;
 pub mod library;
 pub mod manufacturing;
+pub mod netlist;
 pub mod pcb_board;
 pub mod pcb_components;
 pub mod pcb_export;

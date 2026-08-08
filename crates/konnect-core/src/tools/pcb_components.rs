@@ -6,6 +6,7 @@
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
+use crate::tools::netlist::{parse_board, parse_netlist, Plan};
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::writer::{apply_edits, find_balanced_block, write_atomic, SexpEdit};
@@ -172,6 +173,21 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "reference", "pad", "net_name"]
             }),
             |args, ctx| async move { handle_set_pad_net(args, ctx).await }
+        ),
+        tool!(
+            "update_pcb_from_schematic",
+            "File-based 'Update PCB from Schematic' (KiCAD's F8) for connectivity: exports the schematic's netlist with kicad-cli, then rewrites every board pad's (net ...) and each footprint's Value to match the schematic — the authoritative source — directly in the .kicad_pcb (S-expression edits, no KiCAD IPC). This closes board-vs-schematic net parity in one pass (a bulk set_pad_net). It does NOT add, delete, or refootprint components (that needs library geometry / IPC) or move copper — such cases are reported as warnings, not applied. Defaults to dry_run=true: returns the full diff without touching the file. Set dry_run=false to apply. After applying, re-run DRC; if KiCAD has the board open, revert/reload it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":      { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "schematic":  { "type": "string", "description": "Path to .kicad_sch (default: sibling of the board with the same stem)" },
+                    "netlist":    { "type": "string", "description": "Optional path to a pre-exported kicadsexpr netlist; skips the kicad-cli export" },
+                    "dry_run":    { "type": "boolean", "description": "Report the diff without writing (default true)", "default": true }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_update_pcb_from_schematic(args, ctx).await }
         ),
         tool!(
             "get_component_list",
@@ -542,7 +558,11 @@ async fn handle_set_pad_net(
     };
     let (fp_start, fp_end) = match find_balanced_block(&content, fp_open) {
         Some(r) => r,
-        None => return Ok(CallToolResult::error("Unbalanced footprint block".to_string())),
+        None => {
+            return Ok(CallToolResult::error(
+                "Unbalanced footprint block".to_string(),
+            ))
+        }
     };
 
     // 3. Locate the target pad within that footprint. Trailing space keeps
@@ -635,6 +655,243 @@ async fn handle_set_pad_net(
         "net_code": net_code,
         "old_net": old_net,
         "note": "Pad net rewritten in the .kicad_pcb. Copper was not moved — re-run DRC to verify. If KiCAD has the board open, revert/reload it to see the change."
+    })))
+}
+
+/// Render a [`Plan`] as the JSON report both dry-run and apply return.
+fn plan_report(plan: &Plan) -> serde_json::Value {
+    json!({
+        "pad_net_changes": plan.pad_net_changes.iter().map(|c| json!({
+            "reference": c.reference, "pad": c.pad, "from": c.old, "to": c.new
+        })).collect::<Vec<_>>(),
+        "value_changes": plan.value_changes.iter().map(|c| json!({
+            "reference": c.reference, "from": c.old, "to": c.new
+        })).collect::<Vec<_>>(),
+        "nets_to_add": plan.nets_to_add,
+        "warnings": {
+            "missing_on_board": plan.missing_on_board,
+            "extra_on_board": plan.extra_on_board,
+            "footprint_mismatches": plan.footprint_mismatches.iter().map(|(r, b, s)| json!({
+                "reference": r, "board": b, "schematic": s
+            })).collect::<Vec<_>>(),
+            "unmatched_board_pads": plan.unmatched_board_pads.iter().map(|(r, p)| json!({
+                "reference": r, "pad": p
+            })).collect::<Vec<_>>(),
+        }
+    })
+}
+
+/// Locate the `(footprint ...)` block enclosing the given reference designator.
+/// The trailing quote in the search pattern keeps 'U1' from matching 'U10'.
+fn locate_fp_block(content: &str, reference: &str) -> Option<(usize, usize)> {
+    let ref_pat = format!("(property \"Reference\" \"{}\"", reference);
+    let ref_pos = content.find(&ref_pat)?;
+    let fp_open = content[..ref_pos].rfind("(footprint ")?;
+    find_balanced_block(content, fp_open)
+}
+
+fn escape_sexp_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+async fn handle_update_pcb_from_schematic(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+
+    // 1. Obtain the schematic netlist: use a pre-exported one if given, else
+    //    export from the schematic (sibling of the board by default) via kicad-cli.
+    let netlist_content = if let Some(nl) = args["netlist"].as_str() {
+        std::fs::read_to_string(nl)?
+    } else {
+        let schematic = match args["schematic"].as_str() {
+            Some(s) => std::path::PathBuf::from(s),
+            None => board_path.with_extension("kicad_sch"),
+        };
+        if !schematic.exists() {
+            return Ok(CallToolResult::error(format!(
+                "Schematic not found at '{}'. Pass 'schematic' or 'netlist' explicitly.",
+                schematic.display()
+            )));
+        }
+        let out = board_path.with_extension("sync.net");
+        if let Err(e) =
+            super::cli::export_netlist(&ctx.config.kicad_cli, &schematic, &out, "kicadsexpr").await
+        {
+            return Ok(CallToolResult::error(format!(
+                "kicad-cli netlist export failed: {e}"
+            )));
+        }
+        let content = std::fs::read_to_string(&out)?;
+        let _ = std::fs::remove_file(&out);
+        content
+    };
+
+    // 2. Parse both sides and diff.
+    let nl = parse_netlist(&netlist_content)?;
+    let content = std::fs::read_to_string(&board_path)?;
+    let board = parse_board(&content)?;
+    let plan = crate::tools::netlist::plan(&nl, &board);
+    let report = plan_report(&plan);
+
+    if dry_run {
+        return Ok(CallToolResult::json(&json!({
+            "board": board_path.display().to_string(),
+            "dry_run": true,
+            "would_change": {
+                "pad_nets": plan.pad_net_changes.len(),
+                "values": plan.value_changes.len(),
+                "nets_added": plan.nets_to_add.len(),
+            },
+            "plan": report,
+            "note": "Dry run — nothing written. Re-run with dry_run=false to apply. Warnings (missing/extra/refootprint) are not applied automatically."
+        })));
+    }
+
+    if plan.is_empty() {
+        return Ok(CallToolResult::json(&json!({
+            "board": board_path.display().to_string(),
+            "dry_run": false,
+            "applied": { "pad_nets": 0, "values": 0, "nets_added": 0 },
+            "plan": report,
+            "note": "Board already matches the schematic for pad nets and values. No changes written."
+        })));
+    }
+
+    // 3. Build the net name→code map and append any nets a coded board is
+    //    missing, assigning fresh codes after the current maximum.
+    let tree = konnect_sexp::parser::parse_sexp(&content)?;
+    let mut name_to_code: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut max_code = 0i64;
+    for n in tree.find_all("net") {
+        if let (Some(code), Some(name)) = (
+            n.get(1)
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<i64>().ok()),
+            n.get(2).and_then(|x| x.as_str()),
+        ) {
+            name_to_code.insert(name.to_string(), code);
+            max_code = max_code.max(code);
+        }
+    }
+    let mut edits: Vec<SexpEdit> = Vec::new();
+    if !plan.nets_to_add.is_empty() {
+        let mut table_additions = String::new();
+        for name in &plan.nets_to_add {
+            max_code += 1;
+            name_to_code.insert(name.clone(), max_code);
+            table_additions.push_str(&format!(
+                "\n  (net {} \"{}\")",
+                max_code,
+                escape_sexp_str(name)
+            ));
+        }
+        let close_pos = content.rfind(')').unwrap_or(content.len());
+        edits.push(SexpEdit::insert(close_pos, table_additions));
+    }
+
+    // 4. Pad net rewrites — one edit per changed pad, format-preserving
+    //    (coded `(net <code> "name")` vs name-only `(net "name")`).
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+    for ch in &plan.pad_net_changes {
+        let Some((fp_start, fp_end)) = locate_fp_block(&content, &ch.reference) else {
+            skipped.push(json!({ "reference": ch.reference, "pad": ch.pad, "reason": "footprint block not found" }));
+            continue;
+        };
+        let pad_pat = format!("(pad \"{}\" ", ch.pad);
+        let Some(pad_rel) = content[fp_start..fp_end].find(&pad_pat) else {
+            skipped.push(
+                json!({ "reference": ch.reference, "pad": ch.pad, "reason": "pad not found" }),
+            );
+            continue;
+        };
+        let pad_pos = fp_start + pad_rel;
+        let Some((pad_start, pad_end)) = find_balanced_block(&content, pad_pos) else {
+            skipped.push(json!({ "reference": ch.reference, "pad": ch.pad, "reason": "unbalanced pad block" }));
+            continue;
+        };
+
+        // Existing (net ...) on this pad, if any, and whether it's coded.
+        let existing = content[pad_start..pad_end].find("(net ").and_then(|rel| {
+            let abs = pad_start + rel;
+            find_balanced_block(&content, abs).map(|(s, e)| (s, e))
+        });
+        let coded = match existing {
+            Some((s, e)) => content[s..e]
+                .trim_start()
+                .trim_start_matches("(net")
+                .trim_start()
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit()),
+            None => board.uses_codes,
+        };
+
+        let new_net = if coded {
+            match name_to_code.get(&ch.new) {
+                Some(code) => format!("(net {} \"{}\")", code, escape_sexp_str(&ch.new)),
+                None => {
+                    skipped.push(json!({ "reference": ch.reference, "pad": ch.pad, "reason": format!("net '{}' has no code", ch.new) }));
+                    continue;
+                }
+            }
+        } else {
+            format!("(net \"{}\")", escape_sexp_str(&ch.new))
+        };
+
+        match existing {
+            Some((s, e)) => edits.push(SexpEdit::replace(s, e, new_net)),
+            None => edits.push(SexpEdit::insert(pad_end - 1, format!(" {new_net}"))),
+        }
+    }
+
+    // 5. Value rewrites — replace the quoted string in the footprint's
+    //    (property "Value" "...") node.
+    for ch in &plan.value_changes {
+        let Some((fp_start, fp_end)) = locate_fp_block(&content, &ch.reference) else {
+            skipped.push(json!({ "reference": ch.reference, "field": "Value", "reason": "footprint block not found" }));
+            continue;
+        };
+        let val_pat = "(property \"Value\" \"";
+        let Some(rel) = content[fp_start..fp_end].find(val_pat) else {
+            skipped.push(json!({ "reference": ch.reference, "field": "Value", "reason": "Value property not found" }));
+            continue;
+        };
+        let val_open = fp_start + rel + val_pat.len();
+        // Old value runs to the next unescaped quote.
+        let Some(close_rel) = content[val_open..fp_end].find('"') else {
+            skipped.push(json!({ "reference": ch.reference, "field": "Value", "reason": "unterminated Value string" }));
+            continue;
+        };
+        let val_close = val_open + close_rel;
+        edits.push(SexpEdit::replace(
+            val_open,
+            val_close,
+            escape_sexp_str(&ch.new),
+        ));
+    }
+
+    let applied_pad_nets =
+        plan.pad_net_changes.len() - skipped.iter().filter(|s| s["pad"].is_string()).count();
+    let applied_values =
+        plan.value_changes.len() - skipped.iter().filter(|s| s["field"].is_string()).count();
+
+    let new_content = apply_edits(content, edits);
+    write_atomic(&board_path, &new_content)?;
+
+    Ok(CallToolResult::json(&json!({
+        "board": board_path.display().to_string(),
+        "dry_run": false,
+        "applied": {
+            "pad_nets": applied_pad_nets,
+            "values": applied_values,
+            "nets_added": plan.nets_to_add.len(),
+        },
+        "skipped": skipped,
+        "plan": report,
+        "note": "Applied to the .kicad_pcb. Copper was not moved — re-run DRC to verify. Warnings (missing/extra/refootprint components) were not applied. If KiCAD has the board open, revert/reload it."
     })))
 }
 
@@ -832,4 +1089,151 @@ async fn handle_get_board_2d_view(
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(CallToolResult::image(b64, "image/png"))
+}
+
+#[cfg(test)]
+mod update_from_schematic_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// End-to-end apply on a synthetic name-only board: a dry run reports the
+    /// stale pad and value, then dry_run=false rewrites both in the file.
+    #[tokio::test]
+    async fn dry_run_then_apply_fixes_pad_net_and_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        let netlist = dir.path().join("b.net");
+        std::fs::write(
+            &board,
+            r#"(kicad_pcb
+  (footprint "R_0402" (layer "F.Cu")
+    (property "Reference" "R1" (at 0 0))
+    (property "Value" "1k" (at 0 0))
+    (pad "1" smd roundrect (at 0 0) (net "OLD"))
+    (pad "2" smd roundrect (at 1 0) (net "GND")))
+)
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &netlist,
+            r#"(export (components
+                 (comp (ref "R1") (value "10k") (footprint "R_0402")))
+               (nets
+                 (net (code "1") (name "VCC") (node (ref "R1") (pin "1")))
+                 (net (code "2") (name "GND") (node (ref "R1") (pin "2")))))"#,
+        )
+        .unwrap();
+
+        let ctx = test_ctx();
+
+        // Dry run: reports 1 pad net + 1 value change, writes nothing.
+        let dry = handle_update_pcb_from_schematic(
+            &json!({ "board": board.to_str().unwrap(), "netlist": netlist.to_str().unwrap() }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let d = body(&dry);
+        assert_eq!(d["dry_run"], json!(true));
+        assert_eq!(d["would_change"]["pad_nets"], json!(1));
+        assert_eq!(d["would_change"]["values"], json!(1));
+        assert!(std::fs::read_to_string(&board)
+            .unwrap()
+            .contains("(net \"OLD\")"));
+
+        // Apply.
+        let applied = handle_update_pcb_from_schematic(
+            &json!({ "board": board.to_str().unwrap(), "netlist": netlist.to_str().unwrap(), "dry_run": false }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let a = body(&applied);
+        assert_eq!(a["applied"]["pad_nets"], json!(1));
+        assert_eq!(a["applied"]["values"], json!(1));
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert!(
+            updated.contains("(net \"VCC\")"),
+            "pad1 should be on VCC now"
+        );
+        assert!(!updated.contains("(net \"OLD\")"), "stale OLD net gone");
+        assert!(
+            updated.contains("\"Value\" \"10k\""),
+            "value updated to 10k"
+        );
+        // Name-only board: no numeric net table introduced.
+        assert!(!updated.contains("(net 1 "), "must stay name-only");
+    }
+
+    /// Live check against a real board + pre-exported netlist. Skipped unless
+    /// TEST_PCB and TEST_NETLIST are set; applies to a temp copy and asserts the
+    /// board carries no more pad-net changes on a second pass (idempotent).
+    #[tokio::test]
+    async fn live_apply_is_idempotent() {
+        let (Ok(pcb), Ok(nl)) = (std::env::var("TEST_PCB"), std::env::var("TEST_NETLIST")) else {
+            eprintln!("SKIP: set TEST_PCB and TEST_NETLIST to run the live sync test");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // Persist the applied board to TEST_OUT if set (so an external DRC parity
+        // check can inspect it); otherwise keep it in the temp dir.
+        let board = match std::env::var("TEST_OUT") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => dir.path().join("live.kicad_pcb"),
+        };
+        std::fs::copy(&pcb, &board).unwrap();
+        let ctx = test_ctx();
+
+        let first = body(
+            &handle_update_pcb_from_schematic(
+                &json!({ "board": board.to_str().unwrap(), "netlist": nl, "dry_run": false }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        eprintln!(
+            "LIVE first apply: {}",
+            serde_json::to_string_pretty(&first).unwrap()
+        );
+
+        let second = body(
+            &handle_update_pcb_from_schematic(
+                &json!({ "board": board.to_str().unwrap(), "netlist": nl }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            second["would_change"]["pad_nets"],
+            json!(0),
+            "after applying, a dry run must find no more pad-net changes"
+        );
+        assert_eq!(second["would_change"]["values"], json!(0));
+    }
 }
