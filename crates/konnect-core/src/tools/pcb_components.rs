@@ -1189,6 +1189,23 @@ mod update_from_schematic_tests {
         assert!(!updated.contains("(net 1 "), "must stay name-only");
     }
 
+    /// Diagnostic: print the dry-run diff for a real board + netlist without
+    /// writing anything. Skipped unless TEST_PCB and TEST_NETLIST are set.
+    #[tokio::test]
+    async fn live_dry_run_report() {
+        let (Ok(pcb), Ok(nl)) = (std::env::var("TEST_PCB"), std::env::var("TEST_NETLIST")) else {
+            eprintln!("SKIP: set TEST_PCB and TEST_NETLIST to run the live report");
+            return;
+        };
+        let ctx = test_ctx();
+        let r = body(
+            &handle_update_pcb_from_schematic(&json!({ "board": pcb, "netlist": nl }), &ctx)
+                .await
+                .unwrap(),
+        );
+        eprintln!("LIVE dry run: {}", serde_json::to_string_pretty(&r).unwrap());
+    }
+
     /// Live check against a real board + pre-exported netlist. Skipped unless
     /// TEST_PCB and TEST_NETLIST are set; applies to a temp copy and asserts the
     /// board carries no more pad-net changes on a second pass (idempotent).
