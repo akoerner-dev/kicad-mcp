@@ -32,6 +32,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Also run board-vs-schematic parity (--schematic-parity). Requires the sibling .kicad_sch next to the board. Default false.",
                         "default": false
                     },
+                    "refill_zones": {
+                        "type": "boolean",
+                        "description": "Refill copper zones before checking (--refill-zones), matching the KiCAD GUI's 'Refill all zones before DRC'. Without it, stale zone fills produce phantom clearance/short/mask violations. Default false.",
+                        "default": false
+                    },
                     "severity": {
                         "type": "string",
                         "description": "Minimum violation severity to include: 'error', 'warning' (default), 'info'",
@@ -221,8 +226,14 @@ async fn handle_run_drc(
             "violations": filtered.iter().map(|v| json!({
                 "severity": v.severity,
                 "kind": v.kind,
+                "type": v.rule_type,
                 "description": v.description,
-                "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y }))
+                "pos": v.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+                "items": v.items.iter().map(|it| json!({
+                    "description": it.description,
+                    "pos": it.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+                    "uuid": it.uuid
+                })).collect::<Vec<_>>()
             })).collect::<Vec<_>>()
         }))
         .unwrap(),

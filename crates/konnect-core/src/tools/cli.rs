@@ -44,7 +44,25 @@ pub struct DrcViolation {
     /// "unconnected" (ratsnest / copper connectivity) or "parity"
     /// (board-vs-schematic netlist mismatch).
     pub kind: String,
+    /// KiCAD's machine-readable violation type, e.g. "shorting_items",
+    /// "silk_over_copper", "lib_footprint_issues". Empty when the report omits it.
+    pub rule_type: String,
+    /// Convenience: position of the first referenced item that carries one
+    /// (units per the report's `coordinate_units`, normally mm). `None` when no
+    /// item has a position.
     pub pos: Option<ErcPos>,
+    /// Every object the violation references, each with its own position. A
+    /// short, for example, lists the two colliding items at their two locations,
+    /// which is what a caller needs to actually go fix it.
+    pub items: Vec<DrcItem>,
+}
+
+/// A single object referenced by a DRC violation (a pad, track, footprint, …).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrcItem {
+    pub description: String,
+    pub pos: Option<ErcPos>,
+    pub uuid: Option<String>,
 }
 
 // ─── KiCAD CLI Runner ─────────────────────────────────────────────────────────
@@ -205,6 +223,28 @@ fn parse_drc_section(
         return;
     };
     for v in arr {
+        // KiCAD nests coordinates inside each referenced item, not on the
+        // violation itself, so gather them from `items[]`.
+        let items: Vec<DrcItem> = v
+            .get("items")
+            .and_then(|i| i.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|it| DrcItem {
+                        description: it["description"].as_str().unwrap_or("").to_string(),
+                        pos: it.get("pos").and_then(|p| {
+                            Some(ErcPos {
+                                x: p["x"].as_f64()?,
+                                y: p["y"].as_f64()?,
+                            })
+                        }),
+                        uuid: it["uuid"].as_str().map(String::from),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The first item that has a position doubles as the violation headline.
+        let pos = items.iter().find_map(|it| it.pos.clone());
         out.push(DrcViolation {
             severity: v["severity"]
                 .as_str()
@@ -212,12 +252,9 @@ fn parse_drc_section(
                 .to_string(),
             description: v["description"].as_str().unwrap_or("").to_string(),
             kind: kind.to_string(),
-            pos: v.get("pos").and_then(|p| {
-                Some(ErcPos {
-                    x: p["x"].as_f64()?,
-                    y: p["y"].as_f64()?,
-                })
-            }),
+            rule_type: v["type"].as_str().unwrap_or("").to_string(),
+            pos,
+            items,
         });
     }
 }
