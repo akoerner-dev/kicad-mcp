@@ -437,9 +437,12 @@ async fn handle_get_component_pads(
             let rad = fp_rot.to_radians();
             let board_x = fp_x + local_x * rad.cos() - local_y * rad.sin();
             let board_y = fp_y + local_x * rad.sin() + local_y * rad.cos();
+            // Pad net is `(net <code> "name")` on coded boards or `(net "name")`
+            // on name-only boards — the name is at index 2 or, lacking a code,
+            // index 1. Reading only index 2 returned "" for name-only files.
             let net = pad
                 .find("net")
-                .and_then(|n| n.get(2))
+                .and_then(|n| n.get(2).or_else(|| n.get(1)))
                 .and_then(|n| n.as_str())
                 .unwrap_or("")
                 .to_string();
