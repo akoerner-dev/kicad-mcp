@@ -449,10 +449,12 @@ async fn handle_get_component_pads(
             let pad_at = pad.find("at")?;
             let local_x = pad_at.get_f64(1)?;
             let local_y = pad_at.get_f64(2)?;
-            // Transform local pad coords to board space (simplified: only rotation)
+            // Transform local pad coords to board space. KiCAD's `at` rotation is
+            // clockwise-positive (Y axis points down) — see the matching fix and
+            // live-DRC-verified derivation in pcb_routing.rs::find_pad_board_position.
             let rad = fp_rot.to_radians();
-            let board_x = fp_x + local_x * rad.cos() - local_y * rad.sin();
-            let board_y = fp_y + local_x * rad.sin() + local_y * rad.cos();
+            let board_x = fp_x + local_x * rad.cos() + local_y * rad.sin();
+            let board_y = fp_y - local_x * rad.sin() + local_y * rad.cos();
             // Pad net is `(net <code> "name")` on coded boards or `(net "name")`
             // on name-only boards — the name is at index 2 or, lacking a code,
             // index 1. Reading only index 2 returned "" for name-only files.

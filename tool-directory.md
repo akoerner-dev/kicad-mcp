@@ -220,8 +220,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the PCB as a 2D image using kicad-cli; returns base64 PNG. |
 
-### `pcb_routing` · 12 tools
-**Purpose:** Traces, vias, copper pours, net classes, differential pairs.
+### `pcb_routing` · 13 tools
+**Purpose:** Traces, vias, copper pours, net classes, differential pairs, ratsnest.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
 | Tool | Description |
@@ -234,6 +234,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `delete_trace` | Delete a trace segment identified by its UUID via KiCAD IPC. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |
+| `get_unrouted_connections` | List missing copper connections (ratsnest) per net, resolved to exact (reference, pad) pairs by position — not locale-dependent text parsing. |
 | `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
 | `create_netclass` | Add a netclass definition to the board's design rules (S-expression insert). |
 | `assign_net_to_class` | Assign a net to an existing netclass in the PCB file (S-expression edit). |

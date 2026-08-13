@@ -10,6 +10,8 @@ use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::writer::{apply_edits, new_uuid, write_atomic, SexpEdit};
 use serde_json::json;
 
+use super::cli;
+
 // ─── IPC helper ───────────────────────────────────────────────────────────────
 
 async fn with_ipc<T, F>(addr: String, f: F) -> anyhow::Result<Result<T, String>>
@@ -203,6 +205,36 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board"]
             }),
             |args, ctx| async move { handle_get_nets_list(args, ctx).await }
+        ),
+        tool!(
+            "get_unrouted_connections",
+            "List missing copper connections (ratsnest) on the board: for each net, the pad \
+             pairs that KiCAD's DRC connectivity check considers still unconnected. Built on \
+             `pcb drc`'s `unconnected_items` section, but resolves each item to its exact \
+             (reference, pad, net) by matching board-space position against the board's own \
+             pads rather than parsing KiCAD's localized violation text — works regardless of \
+             KiCAD's UI language. This is the pad-pair list an auto-router or a routing loop \
+             needs; `run_drc` (verification toolset) only exposes the raw DRC report.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "refill_zones": {
+                        "type": "boolean",
+                        "description": "Refill copper zones before checking (matches the GUI's \
+                            'Refill all zones before DRC'). A pad only touching an unfilled zone \
+                            looks unconnected without this. Default true.",
+                        "default": true
+                    },
+                    "net_filter": {
+                        "type": "array",
+                        "description": "Only return connections on these net names (optional)",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_get_unrouted_connections(args, ctx).await }
         ),
         tool!(
             "modify_trace",
@@ -443,10 +475,16 @@ fn find_pad_board_position(
     let local_x = pad_at.get_f64(1).unwrap_or(0.0);
     let local_y = pad_at.get_f64(2).unwrap_or(0.0);
 
-    // Transform local pad coords to board space (rotation)
+    // Transform local pad coords to board space. KiCAD's `at` rotation is
+    // clockwise-positive (Y axis points down), i.e. the mirror of the
+    // standard CCW math convention — verified against a real kicad-cli DRC
+    // report: a -90° footprint with pad "2" at local (0.9125, 0) reports that
+    // pad at board (fp_x, fp_y + 0.9125), which only this sign combination
+    // reproduces. Using the naive CCW formula silently swaps pads on any
+    // 90°/270° rotated footprint (invisible at 0°/180°, where sin(rad)==0).
     let rad = fp_rot.to_radians();
-    let board_x = fp_x + local_x * rad.cos() - local_y * rad.sin();
-    let board_y = fp_y + local_x * rad.sin() + local_y * rad.cos();
+    let board_x = fp_x + local_x * rad.cos() + local_y * rad.sin();
+    let board_y = fp_y - local_x * rad.sin() + local_y * rad.cos();
 
     Ok((board_x, board_y))
 }
@@ -798,4 +836,386 @@ async fn handle_route_diff_pair(
         "net_pos": net_pos, "net_neg": net_neg,
         "layer": layer, "width": width, "gap": gap
     })))
+}
+
+// ─── Ratsnest / unrouted connections ───────────────────────────────────────────
+
+/// One pad's board-space position and net, resolved from the S-expression tree.
+struct PadRecord {
+    reference: String,
+    pad_number: String,
+    net: String,
+    x: f64,
+    y: f64,
+    through_hole: bool,
+}
+
+/// Enumerate every pad on the board with its board-space position and net.
+/// Reuses the same rotation transform and coded-vs-name-only net fallback as
+/// `find_pad_board_position` / `get_component_pads`, just applied across every
+/// footprint in one pass instead of one reference at a time.
+fn all_pads(tree: &konnect_sexp::parser::SexpNode) -> Vec<PadRecord> {
+    let mut out = Vec::new();
+    for fp in tree.find_all("footprint") {
+        let reference = fp
+            .find_all("property")
+            .iter()
+            .find(|p| p.get(1).and_then(|n| n.as_str()) == Some("Reference"))
+            .and_then(|p| p.get(2))
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
+        if reference.is_empty() {
+            continue;
+        }
+
+        let fp_at = fp.find("at");
+        let fp_x = fp_at.and_then(|a| a.get_f64(1)).unwrap_or(0.0);
+        let fp_y = fp_at.and_then(|a| a.get_f64(2)).unwrap_or(0.0);
+        let fp_rot = fp_at.and_then(|a| a.get_f64(3)).unwrap_or(0.0);
+        let rad = fp_rot.to_radians();
+
+        for pad in fp.find_all("pad") {
+            let Some(pad_number) = pad.get(1).and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let Some(pad_at) = pad.find("at") else {
+                continue;
+            };
+            let local_x = pad_at.get_f64(1).unwrap_or(0.0);
+            let local_y = pad_at.get_f64(2).unwrap_or(0.0);
+            // Same clockwise-positive rotation as find_pad_board_position above.
+            let x = fp_x + local_x * rad.cos() + local_y * rad.sin();
+            let y = fp_y - local_x * rad.sin() + local_y * rad.cos();
+
+            // Pad net is `(net <code> "name")` on coded boards or `(net "name")`
+            // on name-only boards — same fallback as get_component_pads.
+            let net = pad
+                .find("net")
+                .and_then(|n| n.get(2).or_else(|| n.get(1)))
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let pad_type = pad.get(2).and_then(|n| n.as_str()).unwrap_or("");
+            let through_hole = pad_type == "thru_hole" || pad_type == "np_thru_hole";
+
+            out.push(PadRecord {
+                reference: reference.clone(),
+                pad_number: pad_number.to_string(),
+                net,
+                x,
+                y,
+                through_hole,
+            });
+        }
+    }
+    out
+}
+
+/// kicad-cli reports DRC item coordinates in mm at ~1e-6 precision — the same
+/// numbers our own rotation transform produces for the same pad. 0.001mm safely
+/// absorbs float rounding without risking a false match between distinct pads.
+const POS_EPSILON_MM: f64 = 0.001;
+
+/// Find the pad at board position (x, y) within `POS_EPSILON_MM`, closest first.
+fn resolve_pad_at(pads: &[PadRecord], x: f64, y: f64) -> Option<&PadRecord> {
+    pads.iter()
+        .filter(|p| (p.x - x).abs() < POS_EPSILON_MM && (p.y - y).abs() < POS_EPSILON_MM)
+        .min_by(|a, b| {
+            let da = (a.x - x).powi(2) + (a.y - y).powi(2);
+            let db = (b.x - x).powi(2) + (b.y - y).powi(2);
+            da.partial_cmp(&db).unwrap()
+        })
+}
+
+async fn handle_get_unrouted_connections(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let refill_zones = args["refill_zones"].as_bool().unwrap_or(true);
+    let net_filter: Option<Vec<String>> = args["net_filter"].as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
+
+    let violations = cli::run_drc(&ctx.config.kicad_cli, &board_path, refill_zones, false).await?;
+
+    let content = std::fs::read_to_string(&board_path)?;
+    let tree = konnect_sexp::parser::parse_sexp(&content)?;
+    let pads = all_pads(&tree);
+
+    let mut connections = Vec::new();
+    for v in violations.iter().filter(|v| v.kind == "unconnected") {
+        let endpoints: Vec<serde_json::Value> = v
+            .items
+            .iter()
+            .map(|item| {
+                match item
+                    .pos
+                    .as_ref()
+                    .and_then(|p| resolve_pad_at(&pads, p.x, p.y))
+                {
+                    Some(pad) => json!({
+                        "reference": pad.reference,
+                        "pad": pad.pad_number,
+                        "net": pad.net,
+                        "x": pad.x,
+                        "y": pad.y,
+                        "through_hole": pad.through_hole,
+                        "resolved": true
+                    }),
+                    None => json!({
+                        "description": item.description,
+                        "pos": item.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+                        "resolved": false
+                    }),
+                }
+            })
+            .collect();
+
+        let net = endpoints
+            .iter()
+            .find_map(|e| e["net"].as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if let Some(filter) = &net_filter {
+            if !net.is_empty() && !filter.iter().any(|f| f == &net) {
+                continue;
+            }
+        }
+
+        let distance_mm = if endpoints.len() == 2 {
+            match (
+                endpoints[0]["x"].as_f64(),
+                endpoints[0]["y"].as_f64(),
+                endpoints[1]["x"].as_f64(),
+                endpoints[1]["y"].as_f64(),
+            ) {
+                (Some(x1), Some(y1), Some(x2), Some(y2)) => {
+                    Some(((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        connections.push(json!({
+            "net": net,
+            "distance_mm": distance_mm,
+            "endpoints": endpoints
+        }));
+    }
+
+    let mut nets_affected: Vec<String> = connections
+        .iter()
+        .filter_map(|c| c["net"].as_str().map(String::from))
+        .filter(|n| !n.is_empty())
+        .collect();
+    nets_affected.sort();
+    nets_affected.dedup();
+
+    Ok(CallToolResult::json(&json!({
+        "board": board_path.to_str().unwrap_or(""),
+        "refill_zones": refill_zones,
+        "unrouted_count": connections.len(),
+        "nets_affected": nets_affected,
+        "connections": connections
+    })))
+}
+
+#[cfg(test)]
+mod ratsnest_tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"
+    (kicad_pcb
+      (footprint "R" (layer "F.Cu") (uuid "f1")
+        (at 10 20 0)
+        (property "Reference" "R1" (at 0 0 0))
+        (pad "1" smd rect (at -1 0) (size 1 1) (layers "F.Cu") (net "GND"))
+        (pad "2" smd rect (at 1 0) (size 1 1) (layers "F.Cu") (net "VCC"))
+      )
+      (footprint "C" (layer "F.Cu") (uuid "f2")
+        (at 15 20 90)
+        (property "Reference" "C1" (at 0 0 0))
+        (pad "1" thru_hole circle (at 0 -1) (size 1 1) (drill 0.5) (layers "*.Cu") (net "GND"))
+      )
+    )
+    "#;
+
+    #[test]
+    fn all_pads_resolves_reference_net_type_and_rotation() {
+        let tree = konnect_sexp::parser::parse_sexp(SAMPLE).unwrap();
+        let pads = all_pads(&tree);
+        assert_eq!(pads.len(), 3);
+
+        let r1_pad1 = pads
+            .iter()
+            .find(|p| p.reference == "R1" && p.pad_number == "1")
+            .unwrap();
+        assert_eq!(r1_pad1.net, "GND");
+        assert!(!r1_pad1.through_hole);
+        assert!((r1_pad1.x - 9.0).abs() < 1e-9); // 10 + (-1) at 0deg rotation
+        assert!((r1_pad1.y - 20.0).abs() < 1e-9);
+
+        let c1_pad1 = pads.iter().find(|p| p.reference == "C1").unwrap();
+        assert!(c1_pad1.through_hole);
+        assert_eq!(c1_pad1.net, "GND");
+        // 90deg footprint rotation (clockwise-positive) of local (0, -1) around (15, 20):
+        // x = 15 + 0*cos90 + (-1)*sin90 = 14, y = 20 - 0*sin90 + (-1)*cos90 = 20
+        assert!((c1_pad1.x - 14.0).abs() < 1e-9);
+        assert!((c1_pad1.y - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resolve_pad_at_matches_within_epsilon_and_rejects_far_points() {
+        let tree = konnect_sexp::parser::parse_sexp(SAMPLE).unwrap();
+        let pads = all_pads(&tree);
+        let r1_pad2 = pads
+            .iter()
+            .find(|p| p.reference == "R1" && p.pad_number == "2")
+            .unwrap();
+
+        let hit = resolve_pad_at(&pads, r1_pad2.x + 0.0002, r1_pad2.y - 0.0002);
+        assert_eq!(
+            hit.map(|p| (p.reference.as_str(), p.pad_number.as_str())),
+            Some(("R1", "2"))
+        );
+
+        assert!(resolve_pad_at(&pads, 999.0, 999.0).is_none());
+    }
+
+    #[test]
+    fn resolve_pad_at_picks_nearest_on_near_coincident_pads() {
+        // Two pads 0.0005mm apart (below epsilon from either), a probe closer
+        // to one than the other must resolve to the nearer one, not the first.
+        let sample = r#"
+        (kicad_pcb
+          (footprint "A" (layer "F.Cu") (uuid "f1")
+            (at 0 0 0)
+            (property "Reference" "A1" (at 0 0 0))
+            (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "N1"))
+          )
+          (footprint "B" (layer "F.Cu") (uuid "f2")
+            (at 0.0005 0 0)
+            (property "Reference" "B1" (at 0 0 0))
+            (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "N1"))
+          )
+        )
+        "#;
+        let tree = konnect_sexp::parser::parse_sexp(sample).unwrap();
+        let pads = all_pads(&tree);
+        // 0.0001mm from A1 (at x=0), 0.0004mm from B1 (at x=0.0005) — nearer to A1.
+        let hit = resolve_pad_at(&pads, 0.0001, 0.0);
+        assert_eq!(hit.map(|p| p.reference.as_str()), Some("A1"));
+    }
+
+    /// Regression for the rotation-sign bug found while building this tool:
+    /// a real -90°-rotated two-pad resistor footprint (from
+    /// ClearBell_Inneneinheit's R_TOUCH1) whose pad 2 board position was
+    /// independently confirmed via a live kicad-cli DRC report
+    /// (148.35, 116.0125). The pre-fix formula placed pad "2" at pad "1"'s
+    /// spot instead — silently wrong for any 90°/270° rotated footprint.
+    #[test]
+    fn all_pads_matches_live_drc_confirmed_rotated_footprint() {
+        let sample = r#"
+        (kicad_pcb
+          (footprint "Resistor_SMD:R_0603" (layer "F.Cu") (uuid "f1")
+            (at 148.35 115.1 -90)
+            (property "Reference" "R_TOUCH1" (at 0 0 0))
+            (pad "1" smd roundrect (at -0.9125 0 270) (size 0.975 0.95)
+              (layers "F.Cu") (net "Net-(U2-IO32)"))
+            (pad "2" smd roundrect (at 0.9125 0 270) (size 0.975 0.95)
+              (layers "F.Cu") (net "Net-(J_TOUCH1-Pin_1)"))
+          )
+        )
+        "#;
+        let tree = konnect_sexp::parser::parse_sexp(sample).unwrap();
+        let pads = all_pads(&tree);
+
+        let pad2 = pads
+            .iter()
+            .find(|p| p.reference == "R_TOUCH1" && p.pad_number == "2")
+            .unwrap();
+        assert!((pad2.x - 148.35).abs() < 1e-9);
+        assert!((pad2.y - 116.0125).abs() < 1e-9);
+        assert_eq!(pad2.net, "Net-(J_TOUCH1-Pin_1)");
+
+        let pad1 = pads
+            .iter()
+            .find(|p| p.reference == "R_TOUCH1" && p.pad_number == "1")
+            .unwrap();
+        assert!((pad1.x - 148.35).abs() < 1e-9);
+        assert!((pad1.y - 114.1875).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod live_ratsnest_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    /// Live end-to-end check against a real board with a known missing
+    /// connection. Skipped unless TEST_PCB is set, so `cargo test` stays
+    /// green without KiCAD installed.
+    #[tokio::test]
+    async fn live_get_unrouted_connections_resolves_real_pads() {
+        let Ok(pcb) = std::env::var("TEST_PCB") else {
+            eprintln!("SKIP: set TEST_PCB to run the live ratsnest test");
+            return;
+        };
+        let cli_path = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+
+        let ctx = ToolContext::new(
+            ServerConfig {
+                kicad_cli: cli_path,
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        );
+
+        let args = json!({ "board": pcb });
+        let result = handle_get_unrouted_connections(&args, &ctx)
+            .await
+            .expect("get_unrouted_connections should succeed");
+
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str::<serde_json::Value>(text).unwrap()
+            }
+            _ => panic!("expected text content"),
+        };
+
+        eprintln!(
+            "LIVE ratsnest: {}",
+            serde_json::to_string_pretty(&body).unwrap()
+        );
+
+        let count = body["unrouted_count"].as_u64().unwrap();
+        assert!(
+            count > 0,
+            "expected at least one unrouted connection on the probe board"
+        );
+
+        let connections = body["connections"].as_array().unwrap();
+        let resolved_pairs: usize = connections
+            .iter()
+            .flat_map(|c| c["endpoints"].as_array().unwrap())
+            .filter(|e| e["resolved"] == true)
+            .count();
+        assert!(
+            resolved_pairs > 0,
+            "expected at least one endpoint resolved to a real pad, not just raw DRC text"
+        );
+    }
 }
