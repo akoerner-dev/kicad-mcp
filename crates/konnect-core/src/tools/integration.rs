@@ -17,8 +17,11 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
+use anyhow::Context;
 use serde_json::json;
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -724,10 +727,38 @@ async fn handle_get_datasheet_url(
 }
 
 // ─── Freerouting ──────────────────────────────────────────────────────────────
+//
+// kicad-cli dropped Specctra DSN export / SES import in KiCAD 10, but the
+// pcbnew Python module bundled with KiCAD still exposes both as module-level
+// functions (`pcbnew.ExportSpecctraDSN`, `pcbnew.ImportSpecctraSES`) even
+// though kicad-cli no longer calls them. Autoroute shells out to that
+// bundled interpreter for the DSN/SES round-trip and to Freerouting (a
+// separate JAR, run via `java`) for the actual routing in between.
+//
+// VERIFIED against: KiCAD 10.0's bin\python.exe, Freerouting 2.3.0 (which
+// requires a Java 25+ runtime — its release jar is compiled to class file
+// version 69, one past what Java 21 supports).
+
+fn default_freerouting_jar_path() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        PathBuf::from(appdata).join("konnect").join("freerouting.jar")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        PathBuf::from(home).join(".konnect").join("freerouting.jar")
+    }
+}
 
 fn find_freerouting_jar(args: &serde_json::Value) -> Option<PathBuf> {
     if let Some(p) = args["jar_path"].as_str() {
         return Some(PathBuf::from(p));
+    }
+    let default_path = default_freerouting_jar_path();
+    if default_path.exists() {
+        return Some(default_path);
     }
     // Common locations
     let candidates = [
@@ -744,18 +775,390 @@ fn find_freerouting_jar(args: &serde_json::Value) -> Option<PathBuf> {
     None
 }
 
+fn python_exe_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "python.exe"
+    } else {
+        "python3"
+    }
+}
+
+/// Resolve a bare executable name to its full path via the OS's PATH lookup,
+/// so a sibling `python.exe` can be located even when `kicad_binary` in
+/// config is just a bare name like "kicad.exe" rather than an absolute path.
+async fn resolve_on_path(binary: &str) -> Option<PathBuf> {
+    let lookup = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
+    let output = tokio::process::Command::new(lookup)
+        .arg(binary)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout.lines().next()?.trim();
+    if first.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(first))
+    }
+}
+
+/// Fallback for when `kicad_binary` is neither absolute nor found on PATH:
+/// scan `%ProgramFiles%\KiCad\<version>\bin\python.exe`, preferring the
+/// highest installed version. Versions are compared numerically (not as
+/// strings) since "10.0" sorts before "9.0" lexicographically.
+#[cfg(target_os = "windows")]
+fn scan_windows_kicad_python() -> Option<PathBuf> {
+    let program_files =
+        std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
+    let kicad_dir = PathBuf::from(program_files).join("KiCad");
+    let mut versions: Vec<(f64, PathBuf)> = std::fs::read_dir(&kicad_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?;
+            let version: f64 = name.parse().ok()?;
+            Some((version, p))
+        })
+        .collect();
+    versions.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    versions
+        .into_iter()
+        .map(|(_, dir)| dir.join("bin").join("python.exe"))
+        .find(|p| p.exists())
+}
+
+/// Locate KiCAD's bundled Python interpreter (see module doc comment for why
+/// autoroute needs it instead of kicad-cli).
+async fn find_kicad_python(ctx: &ToolContext) -> Option<PathBuf> {
+    let configured = PathBuf::from(&ctx.config.kicad_binary);
+    let bin_dir = if configured.is_absolute() {
+        configured.parent().map(|p| p.to_path_buf())
+    } else {
+        resolve_on_path(&ctx.config.kicad_binary)
+            .await
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    };
+
+    if let Some(dir) = bin_dir {
+        let candidate = dir.join(python_exe_name());
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(p) = scan_windows_kicad_python() {
+            return Some(p);
+        }
+    }
+
+    None
+}
+
+const EXPORT_DSN_PY: &str = r#"import sys
+import pcbnew
+board = pcbnew.LoadBoard(sys.argv[1])
+if not pcbnew.ExportSpecctraDSN(board, sys.argv[2]):
+    print("EXPORT_FAILED")
+    sys.exit(1)
+print("EXPORT_OK")
+"#;
+
+const IMPORT_SES_PY: &str = r#"import sys
+import pcbnew
+board = pcbnew.LoadBoard(sys.argv[1])
+if not pcbnew.ImportSpecctraSES(board, sys.argv[2]):
+    print("IMPORT_FAILED")
+    sys.exit(1)
+board.Save(sys.argv[1])
+print("IMPORT_OK")
+"#;
+
+struct SubprocessOutput {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run `program` with `args`, capturing stdout/stderr, killed if it exceeds
+/// `timeout_dur`. `kill_on_drop(true)` is what makes the kill-on-timeout
+/// actually happen: `wait_with_output()` consumes the `Child` handle, so once
+/// the timeout future is dropped there's no handle left to call `.kill()` on
+/// directly — Tokio does it for us on drop instead. Without this a timed-out
+/// `java` (or `python`) process would leak as an orphan.
+async fn run_subprocess(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+    timeout_dur: Duration,
+) -> anyhow::Result<SubprocessOutput> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let child = cmd.spawn().context("failed to spawn subprocess")?;
+
+    let output = tokio::time::timeout(timeout_dur, child.wait_with_output())
+        .await
+        .with_context(|| format!("subprocess timed out after {:?}", timeout_dur))?
+        .context("subprocess process failed")?;
+
+    Ok(SubprocessOutput {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+/// Best-effort extraction of Freerouting's own "final score: N (X unrouted
+/// and Y violations)" summary line, so the tool result surfaces routing
+/// quality without the caller having to grep the raw log. Returns `None`
+/// (rather than erroring) if the log format doesn't match — this is a
+/// convenience field, not load-bearing for success/failure.
+fn parse_freerouting_summary(log: &str) -> Option<String> {
+    let line = log.lines().rev().find(|l| l.contains("final score:"))?;
+    let start = line.find('(')?;
+    let end = line[start..].find(')')? + start;
+    Some(line[start + 1..end].trim().to_string())
+}
+
+/// Truncate `s` to its last `max_chars` characters, safely (char boundaries,
+/// not byte offsets — a raw byte slice can panic mid-UTF-8-sequence).
+fn tail(s: &str, max_chars: usize) -> String {
+    let trimmed = s.trim();
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        trimmed.to_string()
+    } else {
+        let skip = count - max_chars;
+        format!("...{}", trimmed.chars().skip(skip).collect::<String>())
+    }
+}
+
 async fn handle_autoroute(
-    _args: &serde_json::Value,
-    _ctx: &ToolContext,
+    args: &serde_json::Value,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    // ponytail: Freerouting workflow requires Specctra DSN export + SES import,
-    // both of which were removed from kicad-cli in KiCAD 10. The tool stays in the
-    // registry so callers get a clear error; remove entirely once IPC round-trip lands.
-    Ok(CallToolResult::error(
-        "Autoroute via Freerouting is not available: kicad-cli in KiCAD 10 no longer \
-         supports Specctra DSN export or SES import. Use KiCAD's PCB editor \
-         (File > Export > Specctra DSN, then File > Import > Specctra Session) manually.",
+    let board_path = get_path(args, "board")?;
+    if !board_path.exists() {
+        anyhow::bail!("Board file not found: {}", board_path.display());
+    }
+
+    let jar_path = match find_freerouting_jar(args) {
+        Some(p) => p,
+        None => {
+            return Ok(CallToolResult::error(
+                "freerouting.jar not found. Pass jar_path explicitly, place it at \
+                 %APPDATA%\\konnect\\freerouting.jar (~/.konnect/freerouting.jar on \
+                 macOS/Linux), or download it from \
+                 https://github.com/freerouting/freerouting/releases",
+            ));
+        }
+    };
+
+    let python = match find_kicad_python(ctx).await {
+        Some(p) => p,
+        None => {
+            return Ok(CallToolResult::error(
+                "KiCAD's bundled python.exe was not found next to the KiCAD binary or in \
+                 the standard install locations. Autoroute needs it to export/import \
+                 Specctra DSN/SES files, since kicad-cli no longer supports that in KiCAD 10.",
+            ));
+        }
+    };
+
+    let passes = args["passes"].as_i64().unwrap_or(3).max(1);
+    let timeout_secs = args["timeout_seconds"].as_i64().unwrap_or(120).max(1) as u64;
+
+    let work_dir = std::env::temp_dir().join(format!("konnect_autoroute_{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&work_dir).await?;
+
+    let board_str = board_path.to_str().unwrap_or_default();
+    let dsn_path = work_dir.join("board.dsn");
+    let ses_path = work_dir.join("board.ses");
+    let export_script = work_dir.join("export_dsn.py");
+    let import_script = work_dir.join("import_ses.py");
+    tokio::fs::write(&export_script, EXPORT_DSN_PY).await?;
+    tokio::fs::write(&import_script, IMPORT_SES_PY).await?;
+
+    // Step 1: export Specctra DSN via KiCAD's bundled pcbnew Python module.
+    let export_result = run_subprocess(
+        &python,
+        &[
+            export_script.to_str().unwrap_or_default(),
+            board_str,
+            dsn_path.to_str().unwrap_or_default(),
+        ],
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    if !export_result.success || !dsn_path.exists() {
+        return Ok(CallToolResult::error(format!(
+            "Specctra DSN export failed.\nstdout: {}\nstderr: {}",
+            tail(&export_result.stdout, 2000),
+            tail(&export_result.stderr, 2000)
+        )));
+    }
+
+    // Step 2: autoroute with Freerouting. `-mt 1` (single-threaded route
+    // optimization) is forced rather than exposed as an option: Freerouting
+    // 2.3.0 itself warns at runtime that its multi-threaded optimizer "is
+    // broken and it is known to generate clearance violations" — a
+    // short-circuit risk, not just a quality tradeoff.
+    let passes_str = passes.to_string();
+    let route_result = run_subprocess(
+        "java",
+        &[
+            "-jar",
+            jar_path.to_str().unwrap_or_default(),
+            "-de",
+            dsn_path.to_str().unwrap_or_default(),
+            "-do",
+            ses_path.to_str().unwrap_or_default(),
+            "-mp",
+            &passes_str,
+            "-mt",
+            "1",
+        ],
+        Duration::from_secs(timeout_secs),
+    )
+    .await?;
+
+    if !ses_path.exists() {
+        return Ok(CallToolResult::error(format!(
+            "Freerouting did not produce a session file.\nstdout: {}\nstderr: {}",
+            tail(&route_result.stdout, 4000),
+            tail(&route_result.stderr, 2000)
+        )));
+    }
+
+    let summary = parse_freerouting_summary(&route_result.stdout);
+
+    // Step 3: import the routed session back and overwrite the board in place.
+    let import_result = run_subprocess(
+        &python,
+        &[
+            import_script.to_str().unwrap_or_default(),
+            board_str,
+            ses_path.to_str().unwrap_or_default(),
+        ],
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    if !import_result.success {
+        return Ok(CallToolResult::error(format!(
+            "Specctra SES import failed.\nstdout: {}\nstderr: {}",
+            tail(&import_result.stdout, 2000),
+            tail(&import_result.stderr, 2000)
+        )));
+    }
+
+    tokio::fs::remove_dir_all(&work_dir).await.ok();
+
+    Ok(CallToolResult::text(
+        serde_json::to_string_pretty(&json!({
+            "status": "routed",
+            "board": board_str,
+            "passes": passes,
+            "summary": summary,
+            "note": "Board file was overwritten in place via a separate pcbnew subprocess, \
+                     not through KiCAD's IPC session. If the board is open in KiCAD, close \
+                     and reopen it (or File > Revert) to see the routed traces."
+        }))
+        .unwrap(),
     ))
+}
+
+#[cfg(test)]
+mod live_autoroute_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    /// Live end-to-end check of the DSN export -> Freerouting -> SES import
+    /// pipeline against a real board (via the TEST_PCB env var). Skipped
+    /// cleanly when unset, so the normal `cargo test` run stays green
+    /// without KiCAD/Java/Freerouting installed — mirrors the pattern in
+    /// `cli.rs::live_drc_tests`. Copies the board into its own scratch dir
+    /// first since `handle_autoroute` overwrites its input in place.
+    ///
+    /// Verified locally: routes a real board, segment count increases,
+    /// result carries a `summary` parsed from Freerouting's own log.
+    #[tokio::test]
+    async fn live_autoroute_routes_a_real_board() {
+        let Ok(pcb) = std::env::var("TEST_PCB") else {
+            eprintln!("SKIP: set TEST_PCB to run the live autoroute test");
+            return;
+        };
+
+        let scratch_dir =
+            std::env::temp_dir().join(format!("konnect_test_autoroute_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch_dir).unwrap();
+        let scratch_board = scratch_dir.join("test.kicad_pcb");
+        std::fs::copy(&pcb, &scratch_board).expect("copy TEST_PCB into scratch dir");
+
+        let ctx = ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        );
+
+        let segments_before = std::fs::read_to_string(&scratch_board)
+            .unwrap()
+            .matches("(segment")
+            .count();
+
+        let args = json!({
+            "board": scratch_board.to_str().unwrap(),
+            "passes": 2,
+            "timeout_seconds": 120
+        });
+
+        let result = handle_autoroute(&args, &ctx)
+            .await
+            .expect("handle_autoroute should not error at the Rust level");
+
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        eprintln!("LIVE AUTOROUTE result: {}", text);
+        assert!(!result.is_error, "autoroute failed: {}", text);
+
+        let segments_after = std::fs::read_to_string(&scratch_board)
+            .unwrap()
+            .matches("(segment")
+            .count();
+        eprintln!(
+            "segments before={} after={}",
+            segments_before, segments_after
+        );
+        assert!(
+            segments_after > segments_before,
+            "expected autoroute to add copper traces to the board"
+        );
+
+        std::fs::remove_dir_all(&scratch_dir).ok();
+    }
 }
 
 async fn handle_check_freerouting(
