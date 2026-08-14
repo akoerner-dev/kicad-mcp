@@ -933,6 +933,15 @@ fn parse_freerouting_summary(log: &str) -> Option<String> {
     Some(line[start + 1..end].trim().to_string())
 }
 
+/// Extract Freerouting's startup banner ("Freerouting vX.Y.Z (build-date:
+/// ...)"), which is always the first log line regardless of which flag is
+/// passed — unlike a `--version` flag, which 2.3.0 doesn't have.
+fn parse_freerouting_version(log: &str) -> Option<String> {
+    log.lines()
+        .find(|l| l.contains("Freerouting v"))
+        .map(|l| l.trim().to_string())
+}
+
 /// Truncate `s` to its last `max_chars` characters, safely (char boundaries,
 /// not byte offsets — a raw byte slice can panic mid-UTF-8-sequence).
 fn tail(s: &str, max_chars: usize) -> String {
@@ -1176,26 +1185,34 @@ async fn handle_check_freerouting(
             .unwrap(),
         )),
         Some(jar_path) => {
-            // Try to get version from java -jar freerouting.jar --version
-            let output = tokio::process::Command::new("java")
-                .args(["-jar", jar_path.to_str().unwrap_or(""), "--version"])
-                .output()
-                .await;
-
-            let version = match output {
+            // Freerouting 2.3.0 has no --version flag: passing one falls
+            // through to loading its built-in tutorial board and hanging in
+            // a GUI-like state instead of exiting (confirmed live — the
+            // process needed a manual kill after 90+s). `-h` is a real flag
+            // that exits promptly, and like every invocation it still logs
+            // a "Freerouting vX.Y.Z (build-date: ...)" banner as its first
+            // line, which is parsed out below for the version. The bounded
+            // `run_subprocess` (kill_on_drop + timeout) also means a hang
+            // here can no longer block the tool call or leak the process.
+            let version_output = match run_subprocess(
+                "java",
+                &["-jar", jar_path.to_str().unwrap_or(""), "-h"],
+                Duration::from_secs(20),
+            )
+            .await
+            {
                 Ok(o) => {
-                    let stdout = String::from_utf8_lossy(&o.stdout);
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    format!("{}{}", stdout.trim(), stderr.trim())
+                    let combined = format!("{}\n{}", o.stdout, o.stderr);
+                    parse_freerouting_version(&combined).unwrap_or_else(|| tail(&combined, 200))
                 }
-                Err(e) => format!("java not available: {e}"),
+                Err(e) => format!("java not available or check timed out: {e}"),
             };
 
             Ok(CallToolResult::text(
                 serde_json::to_string_pretty(&json!({
                     "available": true,
                     "jar_path": jar_path.to_str().unwrap_or(""),
-                    "version_output": version
+                    "version_output": version_output
                 }))
                 .unwrap(),
             ))
