@@ -72,7 +72,10 @@ async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<Stri
     info!("[BETA] kicad-cli {} {}", cli, args.join(" "));
 
     let mut cmd = Command::new(cli);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args)
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let child = cmd
         .spawn()
