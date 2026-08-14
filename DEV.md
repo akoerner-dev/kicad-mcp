@@ -195,9 +195,9 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 The server does NOT expose all 171 tools in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
-- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 4 meta-tools, baseline `tools/list` is ~17 tools ≈ 2K tokens.
+- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`, `pcb_routing`. Combined with the 6 meta-tools, baseline `tools/list` is ~32 tools ≈ 3.5K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
-- **`tools/list_changed` notification**: sent on every load/unload so MCP clients refresh their local tool cache.
+- **`tools/list_changed` notification**: sent on every load/unload so MCP clients refresh their local tool cache. Not every client acts on this — one observed client only reads `tools/list` at connection time and never revisits it, leaving runtime-loaded toolsets permanently unreachable there. `pcb_routing` is in the starter kit specifically to route around that gap for the toolset that hits it most.
 - **Error recovery**: if the LLM calls an unloaded tool, `handler.rs` returns an actionable error naming the toolset that owns it (so the LLM can load it and retry in one hop — no extra `list_toolboxes` round-trip).
 
 The router is defined in `crates/konnect-core/src/router/mod.rs`.
@@ -249,7 +249,7 @@ convention for other `kicad-cli`-calling code.
 ## Current Stats
 
 - **18 toolsets, 185 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
-- Baseline `tools/list`: ~19 tools / ~2K tokens (starter kit + meta-tools)
+- Baseline `tools/list`: ~32 tools / ~3.5K tokens (starter kit + meta-tools)
 - Full-catalog `tools/list` (all loaded): ~191 tools / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**

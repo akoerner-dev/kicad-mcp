@@ -8,14 +8,20 @@ use crate::tools::ToolDef;
 
 /// Toolsets auto-loaded when the server starts.
 ///
-/// Kept minimal so that baseline `tools/list` context stays small (~17 tools
-/// including meta-tools ≈ 2K tokens). The LLM expands its toolbelt on demand
-/// via `load_toolset(...)`.
+/// Kept minimal so that baseline `tools/list` context stays small. The LLM
+/// expands its toolbelt on demand via `load_toolset(...)`.
 ///
 /// Starter choices:
 /// - `project` — needed to open / create / save any project
 /// - `config` — user preferences, design rules; call `load_user_config` at session start
-pub static STARTER_KIT: &[&str] = &["project", "config"];
+/// - `pcb_routing` — some MCP clients only read `tools/list` once at connection
+///   time and never act on the `notifications/tools/list_changed` push this
+///   server sends after `load_toolset` (confirmed against a real client,
+///   2026-08-14), so a toolset loaded at runtime can stay permanently
+///   unreachable there even though the server-side toolset system works
+///   correctly. `pcb_routing` is pre-loaded to route around that gap for the
+///   most commonly needed toolset; others still load on demand as normal.
+pub static STARTER_KIT: &[&str] = &["project", "config", "pcb_routing"];
 
 pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     ToolsetMeta {

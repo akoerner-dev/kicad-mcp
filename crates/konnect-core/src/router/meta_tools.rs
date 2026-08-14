@@ -10,9 +10,12 @@
 //!   get_recent_calls(limit?)  — last N tool calls (newest first) with timing + status
 //!   server_stats()            — uptime, per-tool totals/errors, JSONL log path
 //!
-//! At server startup only the STARTER_KIT (`project`, `config`) is pre-loaded so
-//! baseline context stays small. The LLM reads `list_toolboxes` and calls
-//! `load_toolset(name)` to expose the tools it actually needs for the task.
+//! At server startup only the STARTER_KIT (`project`, `config`, `pcb_routing`)
+//! is pre-loaded so baseline context stays small. The LLM reads `list_toolboxes`
+//! and calls `load_toolset(name)` to expose the tools it actually needs for the
+//! task. (`pcb_routing` is pre-loaded rather than on-demand because some MCP
+//! clients never act on the `list_changed` notification sent after a runtime
+//! `load_toolset` — see registry.rs::STARTER_KIT for details.)
 
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::tools::ToolContext;
@@ -25,10 +28,10 @@ pub fn meta_tool_descriptions() -> Vec<McpToolDescription> {
             name: "list_toolboxes".to_string(),
             description:
                 "List all available KiCAD toolsets with descriptions, categories, tool counts, \
-                 and whether each is currently loaded. Only the starter kit (project, config) \
-                 is loaded at startup — call load_toolset(name) to expose additional tools \
-                 in subsequent tools/list responses. Always call this first to discover what \
-                 tools are available for the task."
+                 and whether each is currently loaded. Only the starter kit (project, config, \
+                 pcb_routing) is loaded at startup — call load_toolset(name) to expose \
+                 additional tools in subsequent tools/list responses. Always call this first \
+                 to discover what tools are available for the task."
                     .to_string(),
             input_schema: json!({
                 "type": "object",
