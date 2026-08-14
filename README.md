@@ -29,6 +29,9 @@ against a real board via `kicad-cli`.
 | **`set_pad_net`** | Reassigns one pad's net by rewriting its `(net …)` entry, format-preserving (coded `(net 3 "GND")` vs. name-only `(net "GND")`). | The atomic building block for fixing a swapped/stale pad net without the GUI. |
 | **DRC observability** | `run_drc` now surfaces the report sections the stock path dropped — `unconnected_items` and `schematic_parity` — plus each violation's item positions and machine type, and an optional zone-refill so headless DRC matches the GUI. | The unpatched tool read only `violations` and reported a broken board as "0 errors" — a silent, dangerous blind spot. |
 | **`get_component_pads` fix** | Reads the pad net on name-only boards (index 1 fallback), not just coded ones. | Name-only boards previously returned empty net strings. |
+| **`get_unrouted_connections`** | Ratsnest tool: lists missing copper connections per net, resolving each DRC item to an exact (reference, pad) pair by matching board-space position against the board's own pads — not by parsing KiCad's localized violation text (this install runs German KiCad). | No pad-pair-level ratsnest tool existed; it's the prerequisite input any auto-router or routing loop needs. |
+| **Footprint rotation-sign fix** | `find_pad_board_position` (used by `route_pad_to_pad`) and `get_component_pads` applied a rotation transform with the wrong sign — invisible at 0°/180° (the sign only enters through `sin`), but silently returned the *other* pad's position on any 90°/270°-rotated footprint. Found while verifying the tool above against a live `kicad-cli` DRC report; fixed with a regression test encoding the real rotated footprint that exposed it. | A latent correctness bug in already-shipped tooling — `route_pad_to_pad` could have routed to the wrong pad on a rotated footprint. |
+| **Starter-kit toolset tuning** | Pre-loads `pcb_routing` at server startup instead of only via runtime `load_toolset`. | Traced a real MCP client that reads `tools/list` once at connection and never revisits it — confirmed server-side `list_changed` notifications fire correctly after `load_toolset`, so this routes around a client-side gap rather than a server bug. |
 | **Windows build chain** | GNU-toolchain build recipe + [`BUILD_NOTES_WINDOWS.md`](BUILD_NOTES_WINDOWS.md). | Upstream targeted Unix; getting the `nng`/protobuf stack building under MinGW took real work. |
 
 **Full tool catalogue:** [`tool-directory.md`](tool-directory.md) — 18 on-demand toolsets, ~190 tools.
@@ -50,6 +53,13 @@ against a real board via `kicad-cli`.
   `kicad-cli --schematic-parity` DRC before/after. On the doorbell board the net/value sync
   closed one real parity item (parity 10 → 9) with unconnected staying 0, and is idempotent
   on a second pass.
+- **Blind-tested against a real board fault.** After building `get_unrouted_connections`, I
+  had someone displace a component on a real board without telling me what changed or where.
+  The tool's ratsnest output alone (two dangling-track endpoints, both offset from the same
+  footprint by an identical distance) was enough to localize it to one specific component,
+  and a plain position check against a previously-known-good coordinate for that part
+  confirmed a clean 5 mm translation — correctly separating it from an unrelated pre-existing
+  routing gap on a different net that was *not* part of the injected fault.
 
 Everything above landed as small, reviewed commits on the `drc-parity-unconnected` branch —
 see `git log` for the step-by-step history.
