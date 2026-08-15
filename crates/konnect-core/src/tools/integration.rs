@@ -1026,10 +1026,27 @@ async fn handle_autoroute(
     // 2.3.0 itself warns at runtime that its multi-threaded optimizer "is
     // broken and it is known to generate clearance violations" — a
     // short-circuit risk, not just a quality tradeoff.
+    //
+    // `-Djava.awt.headless=true` is forced too: confirmed live (2026-08-15)
+    // that Freerouting 2.3.0's own exception handling can still try to pop a
+    // Swing error dialog even in `-de/-do` batch mode (hit a
+    // `SearchTreeObject.shape_layer` NullPointerException mid-optimization
+    // that surfaced as a literal "Exception Occurred" window on the user's
+    // desktop, requiring a manual click to dismiss). Without this flag that
+    // dialog is a silent hang risk if nobody is watching — `run_subprocess`'s
+    // timeout would eventually kill it, but only after burning the full
+    // `timeout_secs` budget and losing whatever that run would have
+    // produced. With the flag, AWT throws `HeadlessException` the moment
+    // anything tries to draw a window instead of creating one — verified
+    // (same jar, same DSN, `-mp 3` and `-mp 8`) this does not break normal
+    // `-de/-do` routing (exit 0, valid .ses both times); this is also
+    // Freerouting's own documented way to run as a service, per
+    // github.com/freerouting/freerouting discussion #195.
     let passes_str = passes.to_string();
     let route_result = run_subprocess(
         "java",
         &[
+            "-Djava.awt.headless=true",
             "-jar",
             jar_path.to_str().unwrap_or_default(),
             "-de",
@@ -1052,6 +1069,23 @@ async fn handle_autoroute(
             tail(&route_result.stderr, 2000)
         )));
     }
+
+    // A session file can exist even when Freerouting exited non-zero (e.g.
+    // it hit an internal exception mid-pass but had already written a usable
+    // .ses from an earlier stage) — that must never be swallowed silently,
+    // since the whole point of this tool is running unattended. Surface it
+    // as a warning instead of failing outright, since the produced board is
+    // often still valid (verify with `run_drc`/`get_unrouted_connections`).
+    let route_warning = if !route_result.success {
+        Some(format!(
+            "Freerouting exited with a non-zero status but still produced a session file — \
+             routing may be incomplete or degraded; verify with run_drc before trusting this \
+             result. stderr tail: {}",
+            tail(&route_result.stderr, 1500)
+        ))
+    } else {
+        None
+    };
 
     let summary = parse_freerouting_summary(&route_result.stdout);
 
@@ -1083,6 +1117,7 @@ async fn handle_autoroute(
             "board": board_str,
             "passes": passes,
             "summary": summary,
+            "warning": route_warning,
             "note": "Board file was overwritten in place via a separate pcbnew subprocess, \
                      not through KiCAD's IPC session. If the board is open in KiCAD, close \
                      and reopen it (or File > Revert) to see the routed traces."
@@ -1196,7 +1231,12 @@ async fn handle_check_freerouting(
             // here can no longer block the tool call or leak the process.
             let version_output = match run_subprocess(
                 "java",
-                &["-jar", jar_path.to_str().unwrap_or(""), "-h"],
+                &[
+                    "-Djava.awt.headless=true",
+                    "-jar",
+                    jar_path.to_str().unwrap_or(""),
+                    "-h",
+                ],
                 Duration::from_secs(20),
             )
             .await
