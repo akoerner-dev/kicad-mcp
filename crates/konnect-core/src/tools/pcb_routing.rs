@@ -256,16 +256,21 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "create_netclass",
-            "Add a netclass definition to the board's design rules (S-expression file insert).",
+            "Create or update a netclass. For modern boards (constraints in the sibling \
+             .kicad_pro) this upserts an entry in the project's netclass list; for legacy \
+             boards it inserts a netclass block directly into the .kicad_pcb. On update, \
+             omitted fields are left at their current value — pass ONLY the fields you want \
+             to change. On create (name doesn't exist yet), omitted fields fall back to \
+             0.2mm/0.25mm/0.4mm/0.8mm.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":        { "type": "string" },
                     "name":         { "type": "string", "description": "Netclass name (e.g. 'Power')" },
-                    "clearance":    { "type": "number", "description": "Clearance in mm", "default": 0.2 },
-                    "trace_width":  { "type": "number", "description": "Default trace width in mm", "default": 0.25 },
-                    "via_drill":    { "type": "number", "description": "Via drill diameter in mm", "default": 0.4 },
-                    "via_diameter": { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 }
+                    "clearance":    { "type": "number", "description": "Clearance in mm — omit to leave unchanged on an existing class" },
+                    "trace_width":  { "type": "number", "description": "Default trace width in mm — omit to leave unchanged on an existing class" },
+                    "via_drill":    { "type": "number", "description": "Via drill diameter in mm — omit to leave unchanged on an existing class" },
+                    "via_diameter": { "type": "number", "description": "Via pad diameter in mm — omit to leave unchanged on an existing class" }
                 },
                 "required": ["board", "name"]
             }),
@@ -656,6 +661,111 @@ async fn handle_modify_trace(
     })))
 }
 
+/// Modern (KiCAD 7+) projects store netclasses in the sibling .kicad_pro's
+/// `net_settings.classes[]` instead of the legacy per-class `(net_class Name
+/// ...)` elements KiCad ≤6 wrote directly into the .kicad_pcb (singular,
+/// unwrapped — per KiCad's own file-format docs — not the plural
+/// `(net_classes ...)` container this comment previously and wrongly
+/// assumed). Confirmed live (2026-08-15) against a real KiCad 10 board: no
+/// `(net_class ...)` element anywhere in its .kicad_pcb. `board.with_extension`
+/// gives the sibling path directly since both files share a stem by
+/// convention.
+fn sibling_project_path(board: &std::path::Path) -> Option<std::path::PathBuf> {
+    let candidate = board.with_extension("kicad_pro");
+    candidate.exists().then_some(candidate)
+}
+
+fn project_has_netclasses(project_path: &std::path::Path) -> bool {
+    std::fs::read_to_string(project_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| v.pointer("/net_settings/classes").cloned())
+        .is_some_and(|v| v.is_array())
+}
+
+/// Create or update `name` in the modern project's `net_settings.classes[]`.
+/// Returns `true` if an existing class was updated, `false` if a new one was
+/// appended. Only fields actually present in `args` are applied to an
+/// EXISTING class — the tool's documented defaults (0.2/0.25/0.4/0.8) are
+/// only used to fill in a brand-NEW class, so calling this to nudge one
+/// field on an already-tuned class (e.g. just `trace_width`) never silently
+/// clobbers its other fields (clearance, via sizing, …) back to generic
+/// defaults.
+/// Returns `(updated, final_class)` — `updated` is `true` if an existing
+/// class was patched in place, `false` if a new one was appended;
+/// `final_class` is the class object as it now stands on disk, so callers
+/// can report what's actually there instead of re-deriving it from `args`
+/// (which would wrongly show this tool's generic defaults for fields an
+/// update left untouched).
+fn upsert_project_netclass(
+    project_path: &std::path::Path,
+    name: &str,
+    args: &serde_json::Value,
+) -> anyhow::Result<(bool, serde_json::Value)> {
+    let content = std::fs::read_to_string(project_path)?;
+    let mut root: serde_json::Value = serde_json::from_str(&content)?;
+    let classes = root
+        .pointer_mut("/net_settings/classes")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "project file has no net_settings.classes array: {}",
+                project_path.display()
+            )
+        })?;
+
+    let existing = classes
+        .iter_mut()
+        .find(|c| c.get("name").and_then(|n| n.as_str()) == Some(name));
+
+    let (updated, final_class) = if let Some(class) = existing {
+        for (arg_key, json_key) in [
+            ("clearance", "clearance"),
+            ("trace_width", "track_width"),
+            ("via_drill", "via_drill"),
+            ("via_diameter", "via_diameter"),
+        ] {
+            if let Some(val) = args[arg_key].as_f64() {
+                class[json_key] = json!(val);
+            }
+        }
+        (true, class.clone())
+    } else {
+        // Field set mirrors what KiCad itself writes for a class with no
+        // special tuning — same shape as the project's existing "Default"
+        // class, just with this tool's values for the 4 fields it exposes.
+        let new_class = json!({
+            "name": name,
+            "clearance": args["clearance"].as_f64().unwrap_or(0.2),
+            "track_width": args["trace_width"].as_f64().unwrap_or(0.25),
+            "via_drill": args["via_drill"].as_f64().unwrap_or(0.4),
+            "via_diameter": args["via_diameter"].as_f64().unwrap_or(0.8),
+            "bus_width": 12,
+            "diff_pair_gap": 0.25,
+            "diff_pair_via_gap": 0.25,
+            "diff_pair_width": 0.2,
+            "line_style": 0,
+            "microvia_diameter": 0.3,
+            "microvia_drill": 0.1,
+            "pcb_color": "rgba(0, 0, 0, 0.000)",
+            "priority": 2147483647i64,
+            "schematic_color": "rgba(0, 0, 0, 0.000)",
+            "tuning_profile": "",
+            "wire_width": 6
+        });
+        classes.push(new_class.clone());
+        (false, new_class)
+    };
+
+    // Trailing newline matches what KiCad's own writer produces — keeps a
+    // one-field edit from also flipping the file's EOF-newline status.
+    write_atomic(
+        project_path,
+        &format!("{}\n", serde_json::to_string_pretty(&root)?),
+    )?;
+    Ok((updated, final_class))
+}
+
 async fn handle_create_netclass(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -669,6 +779,30 @@ async fn handle_create_netclass(
     let trace_width = args["trace_width"].as_f64().unwrap_or(0.25);
     let via_drill = args["via_drill"].as_f64().unwrap_or(0.4);
     let via_dia = args["via_diameter"].as_f64().unwrap_or(0.8);
+
+    // Singular, unwrapped element per KiCad's own file-format docs — see the
+    // doc comment on sibling_project_path above for why this isn't
+    // "(net_classes" (a container that doesn't exist in real KiCad files).
+    let has_legacy_block = std::fs::read_to_string(&board_path)?.contains("(net_class ");
+
+    // Prefer the modern project file whenever this board isn't actively
+    // using the legacy (net_class ...) block itself — see doc comments on
+    // sibling_project_path/upsert_project_netclass above.
+    if !has_legacy_block {
+        if let Some(project_path) = sibling_project_path(&board_path) {
+            if project_has_netclasses(&project_path) {
+                let (updated, class) = upsert_project_netclass(&project_path, &name, args)?;
+                return Ok(CallToolResult::json(&json!({
+                    "project_netclass": name,
+                    "updated_existing": updated,
+                    "clearance": class["clearance"],
+                    "trace_width": class["track_width"],
+                    "via_drill": class["via_drill"],
+                    "via_diameter": class["via_diameter"]
+                })));
+            }
+        }
+    }
 
     let netclass_sexp = format!(
         "\n      (netclass \"{name}\"\n        (clearance {clearance})\n        \
@@ -1217,5 +1351,250 @@ mod live_ratsnest_tests {
             resolved_pairs > 0,
             "expected at least one endpoint resolved to a real pad, not just raw DRC text"
         );
+    }
+}
+
+#[cfg(test)]
+mod netclass_json_tests {
+    use super::*;
+
+    /// Mirrors the actual shape found in a real KiCad 10 project (ClearBell
+    /// Ausseneinheit, 2026-08-15): a single "Default" class plus the
+    /// surrounding net_settings keys real projects always carry alongside it.
+    const SAMPLE_PROJECT: &str = r#"{
+        "net_settings": {
+            "classes": [
+                {
+                    "name": "Default",
+                    "clearance": 0.2,
+                    "track_width": 0.2,
+                    "via_diameter": 0.6,
+                    "via_drill": 0.3,
+                    "priority": 2147483647
+                }
+            ],
+            "meta": { "version": 4 },
+            "net_colors": null,
+            "netclass_assignments": null,
+            "netclass_patterns": []
+        },
+        "board": {
+            "design_settings": {
+                "rules": {
+                    "min_clearance": 0.2,
+                    "min_track_width": 0.3
+                }
+            }
+        }
+    }"#;
+
+    fn write_sample(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("board.kicad_pro");
+        std::fs::write(&path, SAMPLE_PROJECT).unwrap();
+        path
+    }
+
+    #[test]
+    fn upsert_updates_existing_class_without_touching_untouched_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_sample(dir.path());
+
+        let args = json!({ "trace_width": 0.3 });
+        let (updated, class) = upsert_project_netclass(&path, "Default", &args).unwrap();
+        assert!(updated, "Default already exists, should update not append");
+        assert_eq!(class["track_width"], 0.3, "returned class reflects the write");
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let classes = saved["net_settings"]["classes"].as_array().unwrap();
+        assert_eq!(classes.len(), 1, "must not duplicate the class");
+        let default = &classes[0];
+        assert_eq!(default["track_width"], 0.3, "the field we asked to change");
+        // Fields NOT passed in `args` must survive untouched — this is the
+        // whole point of upsert vs. blindly re-writing tool defaults.
+        assert_eq!(default["clearance"], 0.2);
+        assert_eq!(default["via_diameter"], 0.6);
+        assert_eq!(default["via_drill"], 0.3);
+        assert_eq!(default["priority"], 2147483647i64);
+    }
+
+    #[test]
+    fn upsert_appends_new_class_with_full_field_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_sample(dir.path());
+
+        let args = json!({ "clearance": 0.25, "trace_width": 0.4 });
+        let (updated, _class) = upsert_project_netclass(&path, "Power", &args).unwrap();
+        assert!(!updated, "Power doesn't exist yet, should append not update");
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let classes = saved["net_settings"]["classes"].as_array().unwrap();
+        assert_eq!(classes.len(), 2, "Default must survive alongside the new class");
+        let power = classes.iter().find(|c| c["name"] == "Power").unwrap();
+        assert_eq!(power["clearance"], 0.25);
+        assert_eq!(power["track_width"], 0.4);
+        // Omitted fields fall back to this tool's documented defaults.
+        assert_eq!(power["via_drill"], 0.4);
+        assert_eq!(power["via_diameter"], 0.8);
+    }
+
+    #[test]
+    fn upsert_errors_cleanly_on_project_without_classes_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pro");
+        std::fs::write(&path, r#"{"meta": {"version": 4}}"#).unwrap();
+
+        let err = upsert_project_netclass(&path, "Default", &json!({})).unwrap_err();
+        assert!(err.to_string().contains("net_settings.classes"));
+    }
+
+    #[test]
+    fn project_has_netclasses_is_false_for_missing_or_malformed_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does_not_exist.kicad_pro");
+        assert!(!project_has_netclasses(&missing));
+
+        let malformed = dir.path().join("malformed.kicad_pro");
+        std::fs::write(&malformed, r#"{"net_settings": {}}"#).unwrap();
+        assert!(!project_has_netclasses(&malformed));
+    }
+
+    /// Regression for the has_legacy_block detection bug found in review
+    /// (2026-08-15): it originally searched for a plural "(net_classes"
+    /// container that real KiCad never writes, so it could never detect a
+    /// genuinely legacy board — meaning an old-format board's actual
+    /// `(net_class ...)` data could get silently bypassed in favor of a
+    /// sibling project's JSON classes. This uses the real, singular,
+    /// unwrapped token from KiCad's own file-format docs.
+    #[tokio::test]
+    async fn create_netclass_prefers_legacy_block_when_board_actively_uses_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        // Real KiCad shape: (net_class ...) as an unwrapped sibling element,
+        // NOT wrapped in a "(net_classes ...)" container — deliberately no
+        // such wrapper here, so this fixture only matches the corrected
+        // has_legacy_block check and would NOT have passed against the
+        // original buggy `contains("(net_classes")` search.
+        std::fs::write(
+            &board,
+            "(kicad_pcb (net_class Default \"\" (clearance 0.2)(trace_width 0.2)(via_dia 0.6)(via_drill 0.3)))",
+        )
+        .unwrap();
+        // A sibling project ALSO has a populated classes array — the legacy
+        // block must still win, since that's what a legacy-format board's
+        // own KiCad instance actually reads.
+        write_sample(dir.path());
+
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+
+        let args = json!({
+            "board": board.to_str().unwrap(),
+            "name": "Power",
+            "trace_width": 0.4
+        });
+        handle_create_netclass(&args, &ctx).await.unwrap();
+
+        // The legacy path was taken: the .kicad_pcb gained the new class...
+        let pcb_content = std::fs::read_to_string(&board).unwrap();
+        assert!(pcb_content.contains("\"Power\""), "legacy insert should have run");
+
+        // ...and the sibling project's classes array was left untouched (no
+        // JSON-path write happened).
+        let saved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("board.kicad_pro")).unwrap(),
+        )
+        .unwrap();
+        let classes = saved["net_settings"]["classes"].as_array().unwrap();
+        assert_eq!(classes.len(), 1, "only the original Default, no Power appended to JSON");
+    }
+
+    #[test]
+    fn upsert_project_netclass_preserves_key_order_on_write() {
+        // Regression for the alphabetical-reorder bug found in review
+        // (2026-08-15): without serde_json's preserve_order feature, writing
+        // back the whole file resorts every key at every level, turning a
+        // one-field edit into a full-file reformat. "zebra" sorts after
+        // "alpha" alphabetically but appears first here — order must survive.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pro");
+        std::fs::write(
+            &path,
+            r#"{"net_settings": {"classes": [{"name": "Default", "zebra_field": 1, "alpha_field": 2}]}}"#,
+        )
+        .unwrap();
+
+        upsert_project_netclass(&path, "Default", &json!({ "trace_width": 0.3 })).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let zebra_pos = raw.find("zebra_field").unwrap();
+        let alpha_pos = raw.find("alpha_field").unwrap();
+        assert!(
+            zebra_pos < alpha_pos,
+            "original key order (zebra before alpha) must survive the round-trip, got: {raw}"
+        );
+    }
+
+    /// Regression for the response-echoes-defaults-not-reality bug found in
+    /// review (2026-08-15), through the actual handler (not just
+    /// upsert_project_netclass directly) — a partial update to an
+    /// already-tuned class must report the class's REAL current field
+    /// values, not this tool's generic hard-coded defaults for whatever
+    /// fields the caller didn't touch.
+    #[tokio::test]
+    async fn create_netclass_response_reflects_actual_values_not_tool_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (setup))").unwrap();
+        // Default class already tuned away from this tool's generic
+        // defaults (0.2/0.25/0.4/0.8) on every field but trace_width.
+        std::fs::write(
+            dir.path().join("board.kicad_pro"),
+            r#"{"net_settings": {"classes": [
+                {"name": "Default", "clearance": 0.15, "track_width": 0.2, "via_drill": 0.3, "via_diameter": 0.6}
+            ]}}"#,
+        )
+        .unwrap();
+
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+
+        let args = json!({
+            "board": board.to_str().unwrap(),
+            "name": "Default",
+            "trace_width": 0.3
+        });
+        let result = handle_create_netclass(&args, &ctx).await.unwrap();
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str::<serde_json::Value>(text).unwrap()
+            }
+            _ => panic!("expected text content"),
+        };
+
+        assert_eq!(body["trace_width"], 0.3, "the field we asked to change");
+        // Untouched fields must report the REAL value (0.15/0.3/0.6), not
+        // this tool's generic defaults (0.2/0.4/0.8) — that mismatch was
+        // exactly the bug.
+        assert_eq!(body["clearance"], 0.15);
+        assert_eq!(body["via_drill"], 0.3);
+        assert_eq!(body["via_diameter"], 0.6);
     }
 }

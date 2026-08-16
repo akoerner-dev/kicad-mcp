@@ -54,7 +54,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size) in the PCB file.",
+            "Set board-level design rules (clearance, trace width, via size). Writes to the \
+             .kicad_pcb for legacy (pre-KiCAD-7) boards; for modern boards, whose constraints \
+             live in the sibling .kicad_pro project file instead, writes there.",
             json!({
                 "type": "object",
                 "properties": {
@@ -71,7 +73,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_design_rules",
-            "Return the current design rule constraints defined in the PCB file.",
+            "Return the current design rule constraints, reading from the .kicad_pcb (legacy \
+             boards) or the sibling .kicad_pro project file (modern boards), whichever the \
+             board actually uses.",
             json!({
                 "type": "object",
                 "properties": {
@@ -240,6 +244,69 @@ async fn handle_run_drc(
     ))
 }
 
+// ─── Design rules: modern (.kicad_pro JSON) project fallback ─────────────────
+//
+// KiCAD 7+ moved board-level constraints out of the .kicad_pcb entirely into
+// the sibling .kicad_pro project file, under `board.design_settings.rules`.
+// Confirmed live (2026-08-15) against a real KiCad 10 board: its .kicad_pcb
+// has zero `min_*` constraint fields anywhere — `read_constraint`/
+// `set_constraint` below were silently blind on any current-generation
+// project, never erroring, just never finding (or ever effectively writing)
+// anything. Each tool-facing arg key maps to the modern JSON key with the
+// same meaning; `min_via_drill` maps to `min_through_hole_diameter` — KiCad
+// 10 merged the old separate "via drill" and "through-hole diameter" floors
+// into one constraint (confirmed against KiCad's own source: drc_engine.cpp
+// builds its HOLE_SIZE_CONSTRAINT lower bound from
+// board_design_settings.cpp's `m_MinThroughDrill`, applied to both via and
+// pad holes) — not "no modern equivalent" as a first pass at this assumed.
+const JSON_RULE_KEYS: &[(&str, &str)] = &[
+    ("min_clearance", "min_clearance"),
+    ("min_trace_width", "min_track_width"),
+    ("min_via_drill", "min_through_hole_diameter"),
+    ("min_via_size", "min_via_diameter"),
+    ("min_hole_to_hole", "min_hole_to_hole"),
+];
+
+fn sibling_project_path(board: &std::path::Path) -> Option<std::path::PathBuf> {
+    let candidate = board.with_extension("kicad_pro");
+    candidate.exists().then_some(candidate)
+}
+
+fn read_project_rule(project_path: &std::path::Path, json_key: &str) -> Option<f64> {
+    let content = std::fs::read_to_string(project_path).ok()?;
+    let root: serde_json::Value = serde_json::from_str(&content).ok()?;
+    root["board"]["design_settings"]["rules"][json_key].as_f64()
+}
+
+/// Upsert `json_key` under `board.design_settings.rules` in the project file.
+/// Errors (rather than silently no-op) if that path isn't an object — a
+/// malformed/unexpected project file should surface, not fail quietly.
+fn write_project_rule(
+    project_path: &std::path::Path,
+    json_key: &str,
+    value: f64,
+) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(project_path)?;
+    let mut root: serde_json::Value = serde_json::from_str(&content)?;
+    let rules = root
+        .pointer_mut("/board/design_settings/rules")
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "project file has no board.design_settings.rules object: {}",
+                project_path.display()
+            )
+        })?;
+    rules.insert(json_key.to_string(), json!(value));
+    // Trailing newline matches what KiCad's own writer produces — keeps a
+    // one-field edit from also flipping the file's EOF-newline status.
+    write_atomic(
+        project_path,
+        &format!("{}\n", serde_json::to_string_pretty(&root)?),
+    )?;
+    Ok(())
+}
+
 // ─── Design rules S-expression helpers ───────────────────────────────────────
 
 /// Read a rule value from `(setup (rules (rule_severity key val) ...))`.
@@ -318,8 +385,10 @@ async fn handle_set_design_rules(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let mut content = tokio::fs::read_to_string(&board).await?;
+    let project_path = sibling_project_path(&board);
 
     let mut changed = Vec::new();
+    let mut content_dirty = false;
 
     let rules: &[(&str, &str)] = &[
         ("min_clearance", "min_clearance"),
@@ -330,13 +399,41 @@ async fn handle_set_design_rules(
     ];
 
     for (sexp_key, arg_key) in rules {
-        if let Some(val) = args[arg_key].as_f64() {
+        let Some(val) = args[arg_key].as_f64() else {
+            continue;
+        };
+        let json_key = JSON_RULE_KEYS
+            .iter()
+            .find(|(k, _)| k == arg_key)
+            .map(|(_, j)| *j);
+
+        // A legacy field already present in THIS board's .kicad_pcb means
+        // it's an old-format board actively using it — keep updating it in
+        // place rather than switching source of truth out from under it.
+        if read_constraint(&content, sexp_key).is_some() {
             content = set_constraint(&content, sexp_key, val);
-            changed.push(format!("{} = {}", sexp_key, val));
+            content_dirty = true;
+            changed.push(format!("{sexp_key} = {val} (board setup)"));
+            continue;
         }
+
+        // No legacy field: prefer the modern project file when one exists
+        // and this key has a JSON equivalent (every key does — see
+        // JSON_RULE_KEYS).
+        if let (Some(project_path), Some(json_key)) = (&project_path, json_key) {
+            write_project_rule(project_path, json_key, val)?;
+            changed.push(format!("{json_key} = {val} (project rules)"));
+            continue;
+        }
+
+        // No sibling project file, or no JSON equivalent for this key:
+        // fall back to the legacy insert, same as before this fix.
+        content = set_constraint(&content, sexp_key, val);
+        content_dirty = true;
+        changed.push(format!("{sexp_key} = {val} (board setup)"));
     }
 
-    if !changed.is_empty() {
+    if content_dirty {
         write_atomic(&board, &content)?;
     }
 
@@ -355,20 +452,248 @@ async fn handle_get_design_rules(
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let content = tokio::fs::read_to_string(&board).await?;
+    let project_path = sibling_project_path(&board);
+
+    let rule = |sexp_key: &str, arg_key: &str| -> Option<f64> {
+        read_constraint(&content, sexp_key).or_else(|| {
+            let json_key = JSON_RULE_KEYS
+                .iter()
+                .find(|(k, _)| *k == arg_key)
+                .map(|(_, j)| *j)?;
+            read_project_rule(project_path.as_deref()?, json_key)
+        })
+    };
 
     Ok(CallToolResult::text(
         serde_json::to_string_pretty(&json!({
             "board": board.to_str().unwrap_or(""),
             "rules": {
-                "min_clearance": read_constraint(&content, "min_clearance"),
-                "min_trace_width": read_constraint(&content, "min_track_width"),
-                "min_via_drill": read_constraint(&content, "min_via_drill"),
-                "min_via_size": read_constraint(&content, "min_via_size"),
-                "min_hole_to_hole": read_constraint(&content, "min_hole_to_hole")
+                "min_clearance": rule("min_clearance", "min_clearance"),
+                "min_trace_width": rule("min_track_width", "min_trace_width"),
+                "min_via_drill": rule("min_via_drill", "min_via_drill"),
+                "min_via_size": rule("min_via_size", "min_via_size"),
+                "min_hole_to_hole": rule("min_hole_to_hole", "min_hole_to_hole")
             }
         }))
         .unwrap(),
     ))
+}
+
+#[cfg(test)]
+mod design_rules_json_tests {
+    use super::*;
+
+    /// Mirrors the actual shape found in a real KiCad 10 project (ClearBell
+    /// Ausseneinheit, 2026-08-15): `min_track_width` set above the "Default"
+    /// class's own `track_width` — the exact contradiction that motivated
+    /// this fallback in the first place.
+    const SAMPLE_PROJECT: &str = r#"{
+        "board": {
+            "design_settings": {
+                "rules": {
+                    "min_clearance": 0.2,
+                    "min_track_width": 0.3,
+                    "min_via_diameter": 0.5,
+                    "min_hole_to_hole": 0.25,
+                    "min_through_hole_diameter": 0.3
+                }
+            }
+        }
+    }"#;
+
+    fn write_sample(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("board.kicad_pro");
+        std::fs::write(&path, SAMPLE_PROJECT).unwrap();
+        path
+    }
+
+    #[test]
+    fn read_project_rule_finds_existing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_sample(dir.path());
+        assert_eq!(read_project_rule(&path, "min_track_width"), Some(0.3));
+        assert_eq!(read_project_rule(&path, "min_via_diameter"), Some(0.5));
+        assert_eq!(read_project_rule(&path, "no_such_key"), None);
+    }
+
+    #[test]
+    fn write_project_rule_updates_key_and_preserves_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_sample(dir.path());
+
+        write_project_rule(&path, "min_track_width", 0.15).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let rules = &saved["board"]["design_settings"]["rules"];
+        assert_eq!(rules["min_track_width"], 0.15, "the field we changed");
+        assert_eq!(rules["min_clearance"], 0.2, "untouched sibling survives");
+        assert_eq!(rules["min_hole_to_hole"], 0.25, "untouched sibling survives");
+    }
+
+    #[test]
+    fn write_project_rule_errors_cleanly_without_rules_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pro");
+        std::fs::write(&path, r#"{"meta": {"version": 4}}"#).unwrap();
+
+        let err = write_project_rule(&path, "min_track_width", 0.3).unwrap_err();
+        assert!(err.to_string().contains("design_settings.rules"));
+    }
+
+    #[test]
+    fn sibling_project_path_none_when_no_project_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        assert_eq!(sibling_project_path(&board), None);
+    }
+
+    #[test]
+    fn sibling_project_path_some_when_project_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb)").unwrap();
+        write_sample(dir.path());
+        assert_eq!(sibling_project_path(&board), Some(dir.path().join("board.kicad_pro")));
+    }
+
+    /// End-to-end through the actual handlers: a board with no legacy
+    /// constraint fields (the real-world case, KiCad 10) must round-trip
+    /// set → get through the sibling project file, not silently no-op.
+    #[tokio::test]
+    async fn set_then_get_design_rules_round_trips_through_project_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (setup))").unwrap();
+        write_sample(dir.path());
+
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+
+        let set_args = json!({
+            "board": board.to_str().unwrap(),
+            "min_trace_width": 0.35
+        });
+        handle_set_design_rules(&set_args, &ctx).await.unwrap();
+
+        // The .kicad_pcb itself must stay untouched — no legacy field ever
+        // existed there, so nothing should have been inserted into it.
+        let pcb_content = std::fs::read_to_string(&board).unwrap();
+        assert!(!pcb_content.contains("min_track_width"));
+
+        let get_args = json!({ "board": board.to_str().unwrap() });
+        let result = handle_get_design_rules(&get_args, &ctx).await.unwrap();
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str::<serde_json::Value>(text).unwrap()
+            }
+            _ => panic!("expected text content"),
+        };
+        assert_eq!(body["rules"]["min_trace_width"], 0.35);
+        // Untouched sibling in the same JSON object still reads correctly.
+        assert_eq!(body["rules"]["min_via_size"], 0.5);
+    }
+
+    /// Regression for the review finding (2026-08-15) that min_via_drill was
+    /// mapped to nothing, based on a factually wrong claim that KiCad 10 has
+    /// no per-board equivalent — it does (min_through_hole_diameter, merged
+    /// with the old through-hole-diameter floor). Without a mapping, this
+    /// key would always fall through to a dead legacy .kicad_pcb write on a
+    /// modern board, exactly the silently-ineffective bug this file exists
+    /// to fix.
+    #[test]
+    fn min_via_drill_maps_to_min_through_hole_diameter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_sample(dir.path());
+        assert_eq!(read_project_rule(&path, "min_through_hole_diameter"), Some(0.3));
+
+        write_project_rule(&path, "min_through_hole_diameter", 0.25).unwrap();
+        assert_eq!(read_project_rule(&path, "min_through_hole_diameter"), Some(0.25));
+
+        assert_eq!(
+            JSON_RULE_KEYS
+                .iter()
+                .find(|(arg_key, _)| *arg_key == "min_via_drill")
+                .map(|(_, json_key)| *json_key),
+            Some("min_through_hole_diameter")
+        );
+    }
+
+    /// Same regression, but through the actual async handlers rather than
+    /// the table/helpers directly — catches a wiring bug (e.g. a typo'd
+    /// arg_key in handle_set_design_rules's local `rules` table) that the
+    /// table-only test above can't see.
+    #[tokio::test]
+    async fn set_then_get_min_via_drill_round_trips_through_project_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (setup))").unwrap();
+        write_sample(dir.path());
+
+        let ctx = ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        );
+
+        let set_args = json!({ "board": board.to_str().unwrap(), "min_via_drill": 0.2 });
+        handle_set_design_rules(&set_args, &ctx).await.unwrap();
+
+        let pcb_content = std::fs::read_to_string(&board).unwrap();
+        assert!(
+            !pcb_content.contains("min_via_drill"),
+            "must land in the project JSON, not get inserted into the .kicad_pcb"
+        );
+
+        let get_args = json!({ "board": board.to_str().unwrap() });
+        let result = handle_get_design_rules(&get_args, &ctx).await.unwrap();
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str::<serde_json::Value>(text).unwrap()
+            }
+            _ => panic!("expected text content"),
+        };
+        assert_eq!(body["rules"]["min_via_drill"], 0.2);
+    }
+
+    /// Regression for the alphabetical-reorder bug found in review
+    /// (2026-08-15): without serde_json's preserve_order feature, writing
+    /// back the whole project file resorts every key at every level. "zebra"
+    /// sorts after "alpha" but appears first here — order must survive.
+    #[test]
+    fn write_project_rule_preserves_key_order_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pro");
+        std::fs::write(
+            &path,
+            r#"{"board": {"design_settings": {"rules": {"zebra_field": 1, "alpha_field": 2, "min_clearance": 0.2}}}}"#,
+        )
+        .unwrap();
+
+        write_project_rule(&path, "min_clearance", 0.15).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let zebra_pos = raw.find("zebra_field").unwrap();
+        let alpha_pos = raw.find("alpha_field").unwrap();
+        assert!(
+            zebra_pos < alpha_pos,
+            "original key order (zebra before alpha) must survive the round-trip, got: {raw}"
+        );
+    }
 }
 
 // ─── KiCAD UI management ──────────────────────────────────────────────────────
