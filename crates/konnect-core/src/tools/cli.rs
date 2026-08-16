@@ -26,12 +26,24 @@ const LONG_TIMEOUT: Duration = Duration::from_secs(600);
 pub struct ErcViolation {
     pub severity: String,
     pub description: String,
+    /// Sheet the violation was reported under, taken from the enclosing
+    /// `sheets[]` entry's `path` (e.g. `"/"` for the root sheet). The violation
+    /// object itself carries no sheet field.
     pub sheet: Option<String>,
-    pub pos: Option<ErcPos>,
+    /// KiCAD's machine-readable violation type, e.g. `"lib_symbol_mismatch"`,
+    /// `"pin_not_connected"`. Empty when the report omits it.
+    pub rule_type: String,
+    /// Convenience: position of the first referenced item that carries one
+    /// (units per the report's `coordinate_units`, normally mm). `None` when no
+    /// item has a position.
+    pub pos: Option<ReportPos>,
+    /// Every object the violation references, each with its own position — the
+    /// symbol, pin or label a caller needs to go look at.
+    pub items: Vec<ReportItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErcPos {
+pub struct ReportPos {
     pub x: f64,
     pub y: f64,
 }
@@ -50,18 +62,20 @@ pub struct DrcViolation {
     /// Convenience: position of the first referenced item that carries one
     /// (units per the report's `coordinate_units`, normally mm). `None` when no
     /// item has a position.
-    pub pos: Option<ErcPos>,
+    pub pos: Option<ReportPos>,
     /// Every object the violation references, each with its own position. A
     /// short, for example, lists the two colliding items at their two locations,
     /// which is what a caller needs to actually go fix it.
-    pub items: Vec<DrcItem>,
+    pub items: Vec<ReportItem>,
 }
 
-/// A single object referenced by a DRC violation (a pad, track, footprint, …).
+/// A single object referenced by a violation — a pad, track or footprint in a
+/// DRC report, a symbol, pin or label in an ERC report. Both reports use the
+/// same item shape, so both parsers share this type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DrcItem {
+pub struct ReportItem {
     pub description: String,
-    pub pos: Option<ErcPos>,
+    pub pos: Option<ReportPos>,
     pub uuid: Option<String>,
 }
 
@@ -136,25 +150,83 @@ pub async fn run_erc(cli: &str, schematic: &Path) -> Result<Vec<ErcViolation>> {
     Ok(violations)
 }
 
+/// Parse the kicad-cli ERC JSON report.
+///
+/// KiCAD nests ERC violations one level deeper than DRC violations: the report
+/// carries **no top-level `violations` array**. Every violation sits under
+/// `sheets[].violations`, and the enclosing sheet's `path` is the only place the
+/// sheet name appears. Reading the top level — which is where the *DRC* report
+/// keeps its array — matches nothing and reports every schematic as clean.
+///
+/// A top-level `violations` array is still folded in when present, so a
+/// flattened or hand-assembled report keeps working.
 fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
-    let arr = match raw.get("violations").and_then(|v| v.as_array()) {
-        Some(a) => a,
-        None => return Vec::new(),
+    let mut out = Vec::new();
+
+    if let Some(arr) = raw.get("violations").and_then(|v| v.as_array()) {
+        out.extend(arr.iter().map(|v| parse_erc_violation(v, None)));
+    }
+
+    if let Some(sheets) = raw.get("sheets").and_then(|v| v.as_array()) {
+        for sheet in sheets {
+            let sheet_path = sheet["path"].as_str();
+            if let Some(arr) = sheet.get("violations").and_then(|v| v.as_array()) {
+                out.extend(arr.iter().map(|v| parse_erc_violation(v, sheet_path)));
+            }
+        }
+    }
+
+    out
+}
+
+/// Build one `ErcViolation`. `sheet_path` is the `path` of the enclosing
+/// `sheets[]` entry, used only when the violation carries no `sheet` of its own.
+fn parse_erc_violation(v: &serde_json::Value, sheet_path: Option<&str>) -> ErcViolation {
+    let (items, pos) = parse_report_items(v);
+    ErcViolation {
+        severity: v["severity"].as_str().unwrap_or("error").to_string(),
+        description: v["description"].as_str().unwrap_or("").to_string(),
+        sheet: v["sheet"].as_str().or(sheet_path).map(String::from),
+        rule_type: v["type"].as_str().unwrap_or("").to_string(),
+        pos,
+        items,
+    }
+}
+
+/// Collect the objects a violation references, plus the position that best
+/// represents the violation as a whole.
+///
+/// Both the ERC and the DRC report nest coordinates inside each referenced item
+/// rather than on the violation itself, so the headline position is the first
+/// item that has one; a violation-level `pos` is honoured as a fallback.
+fn parse_report_items(v: &serde_json::Value) -> (Vec<ReportItem>, Option<ReportPos>) {
+    let read_pos = |value: &serde_json::Value| -> Option<ReportPos> {
+        let p = value.get("pos")?;
+        Some(ReportPos {
+            x: p["x"].as_f64()?,
+            y: p["y"].as_f64()?,
+        })
     };
 
-    arr.iter()
-        .map(|v| ErcViolation {
-            severity: v["severity"].as_str().unwrap_or("error").to_string(),
-            description: v["description"].as_str().unwrap_or("").to_string(),
-            sheet: v["sheet"].as_str().map(String::from),
-            pos: v.get("pos").and_then(|p| {
-                Some(ErcPos {
-                    x: p["x"].as_f64()?,
-                    y: p["y"].as_f64()?,
+    let items: Vec<ReportItem> = v
+        .get("items")
+        .and_then(|i| i.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|it| ReportItem {
+                    description: it["description"].as_str().unwrap_or("").to_string(),
+                    pos: read_pos(it),
+                    uuid: it["uuid"].as_str().map(String::from),
                 })
-            }),
+                .collect()
         })
-        .collect()
+        .unwrap_or_default();
+
+    let pos = items
+        .iter()
+        .find_map(|it| it.pos.clone())
+        .or_else(|| read_pos(v));
+    (items, pos)
 }
 
 // ─── DRC ─────────────────────────────────────────────────────────────────────
@@ -226,28 +298,7 @@ fn parse_drc_section(
         return;
     };
     for v in arr {
-        // KiCAD nests coordinates inside each referenced item, not on the
-        // violation itself, so gather them from `items[]`.
-        let items: Vec<DrcItem> = v
-            .get("items")
-            .and_then(|i| i.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|it| DrcItem {
-                        description: it["description"].as_str().unwrap_or("").to_string(),
-                        pos: it.get("pos").and_then(|p| {
-                            Some(ErcPos {
-                                x: p["x"].as_f64()?,
-                                y: p["y"].as_f64()?,
-                            })
-                        }),
-                        uuid: it["uuid"].as_str().map(String::from),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        // The first item that has a position doubles as the violation headline.
-        let pos = items.iter().find_map(|it| it.pos.clone());
+        let (items, pos) = parse_report_items(v);
         out.push(DrcViolation {
             severity: v["severity"]
                 .as_str()
@@ -638,6 +689,144 @@ pub async fn render_pcb_png(cli: &str, pcb: &Path, output: &Path, layers: &[&str
 }
 
 #[cfg(test)]
+mod erc_report_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Verbatim shape of a `kicad-cli sch erc --format json` report (KiCAD
+    /// 10.0.1), reduced to one sheet and one violation. Deliberately carries **no**
+    /// top-level `violations` key — that is exactly what the report lacks and what
+    /// the old parser was looking for.
+    fn real_report() -> serde_json::Value {
+        json!({
+            "$schema": "https://schemas.kicad.org/erc.v1.json",
+            "coordinate_units": "mm",
+            "date": "2026-08-16T07:41:00+0200",
+            "ignored_checks": [],
+            "included_severities": ["error", "warning"],
+            "kicad_version": "10.0.1",
+            "source": "ClearBell_Ausseneinheit.kicad_sch",
+            "sheets": [{
+                "path": "/",
+                "uuid_path": "/a0793de3-2761-4557-8d55-8bdf4486f7f5",
+                "violations": [{
+                    "description": "Symbol \"LMR33630ADDA\" doesn't match copy in library",
+                    "items": [{
+                        "description": "Symbol U1 [LMR33630ADDA]",
+                        "pos": { "x": 1.3589, "y": 0.9906 },
+                        "uuid": "f9f33a6f-a582-4d28-b159-56d4293a0695"
+                    }],
+                    "severity": "warning",
+                    "type": "lib_symbol_mismatch"
+                }]
+            }]
+        })
+    }
+
+    #[test]
+    fn parse_erc_json_reads_violations_nested_under_sheets() {
+        let raw = real_report();
+
+        // Guard the guard: if a future edit adds a top-level `violations` array to
+        // this fixture, the regression below would pass for the wrong reason — the
+        // exact trap a previous fixture fell into.
+        assert!(
+            raw.get("violations").is_none(),
+            "fixture must not carry a top-level `violations` array"
+        );
+
+        let v = parse_erc_json(&raw);
+        assert_eq!(v.len(), 1, "the sheets[] violation must be picked up");
+
+        let first = &v[0];
+        assert_eq!(first.severity, "warning");
+        assert_eq!(first.rule_type, "lib_symbol_mismatch");
+        assert!(first.description.contains("LMR33630ADDA"));
+        // The sheet name exists only on the enclosing sheets[] entry.
+        assert_eq!(first.sheet.as_deref(), Some("/"));
+        // Coordinates live in items[], never on the violation itself.
+        let pos = first.pos.as_ref().expect("headline pos from the first item");
+        assert_eq!((pos.x, pos.y), (1.3589, 0.9906));
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(
+            first.items[0].uuid.as_deref(),
+            Some("f9f33a6f-a582-4d28-b159-56d4293a0695")
+        );
+    }
+
+    #[test]
+    fn parse_erc_json_attributes_each_violation_to_its_own_sheet() {
+        let raw = json!({
+            "sheets": [
+                { "path": "/", "violations": [{ "severity": "error", "description": "root" }] },
+                { "path": "/Power/", "violations": [{ "severity": "warning", "description": "sub" }] }
+            ]
+        });
+
+        let v = parse_erc_json(&raw);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].sheet.as_deref(), Some("/"));
+        assert_eq!(v[1].sheet.as_deref(), Some("/Power/"));
+        // No items[] at all must not panic and must leave pos empty.
+        assert!(v[0].pos.is_none() && v[0].items.is_empty());
+    }
+
+    #[test]
+    fn parse_erc_json_reports_a_clean_schematic_as_empty() {
+        let raw = json!({ "sheets": [{ "path": "/", "violations": [] }] });
+        assert!(parse_erc_json(&raw).is_empty());
+    }
+
+    #[test]
+    fn parse_erc_json_still_accepts_a_flat_violations_array() {
+        let raw = json!({
+            "violations": [{
+                "severity": "error",
+                "description": "flat",
+                "type": "pin_not_connected",
+                "pos": { "x": 5.0, "y": 6.0 }
+            }]
+        });
+
+        let v = parse_erc_json(&raw);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule_type, "pin_not_connected");
+        // Falls back to the violation-level pos when there are no items.
+        let pos = v[0].pos.as_ref().expect("violation-level pos fallback");
+        assert_eq!((pos.x, pos.y), (5.0, 6.0));
+    }
+
+    /// The DRC path shares `parse_report_items` with ERC since this fix — pin its
+    /// behaviour so the shared helper can't regress one report while fixing the other.
+    #[test]
+    fn parse_drc_section_still_gathers_items_and_headline_pos() {
+        let raw = json!({
+            "violations": [{
+                "severity": "error",
+                "description": "Clearance violation",
+                "type": "clearance",
+                "items": [
+                    { "description": "Track [GND]", "uuid": "aaa" },
+                    { "description": "Pad 2 [VCC]", "pos": { "x": 12.5, "y": 34.0 }, "uuid": "bbb" }
+                ]
+            }]
+        });
+
+        let mut out = Vec::new();
+        parse_drc_section(&raw, "violations", "rule", "error", &mut out);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, "rule");
+        assert_eq!(out[0].rule_type, "clearance");
+        assert_eq!(out[0].items.len(), 2);
+        assert!(out[0].items[0].pos.is_none());
+        // Headline pos skips the item without coordinates.
+        let pos = out[0].pos.as_ref().expect("first item that has a position");
+        assert_eq!((pos.x, pos.y), (12.5, 34.0));
+    }
+}
+
+#[cfg(test)]
 mod live_drc_tests {
     use super::*;
 
@@ -675,5 +864,40 @@ mod live_drc_tests {
         assert!(unconn > 0, "expected unconnected_items to be captured");
         assert!(parity > 0, "expected schematic_parity to be captured");
         assert_eq!(all.len(), rule + unconn + parity, "every entry must be tagged");
+    }
+
+    /// Live end-to-end check of the ERC path against a real schematic that is
+    /// known to have violations. Skipped unless TEST_SCH is set.
+    ///
+    /// Before the sheets[] fix this returned an empty vec for every schematic, so
+    /// "found something at all" is the assertion that matters.
+    #[tokio::test]
+    async fn live_erc_captures_violations_nested_under_sheets() {
+        let Ok(sch) = std::env::var("TEST_SCH") else {
+            eprintln!("SKIP: set TEST_SCH to run the live ERC test");
+            return;
+        };
+        let cli = std::env::var("KICAD_CLI").unwrap_or_else(|_| "kicad-cli".to_string());
+        let schematic = std::path::PathBuf::from(sch);
+
+        let all = run_erc(&cli, &schematic).await.expect("run_erc should succeed");
+
+        eprintln!("LIVE ERC: total={}", all.len());
+        for v in &all {
+            eprintln!(
+                "  [{}/{}] {} (sheet {:?})",
+                v.severity, v.rule_type, v.description, v.sheet
+            );
+        }
+
+        assert!(
+            !all.is_empty(),
+            "expected violations from a schematic known to have them — an empty \
+             result is the exact symptom of reading the wrong report level"
+        );
+        assert!(
+            all.iter().all(|v| v.sheet.is_some()),
+            "every violation must be attributed to its sheet"
+        );
     }
 }

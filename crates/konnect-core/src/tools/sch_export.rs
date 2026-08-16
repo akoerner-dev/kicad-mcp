@@ -272,16 +272,23 @@ async fn handle_run_erc(
         .iter()
         .filter(|v| severity_rank(&v.severity) >= min_rank)
         .map(|v| {
+            // Same shape as run_drc's violations, so a caller can handle both
+            // reports with one code path.
             let mut entry = json!({
                 "severity": v.severity,
                 "description": v.description,
+                "type": v.rule_type,
+                "items": v.items.iter().map(|it| json!({
+                    "description": it.description,
+                    "pos": it.pos.as_ref().map(|p| json!({ "x": p.x, "y": p.y })),
+                    "uuid": it.uuid,
+                })).collect::<Vec<_>>(),
             });
             if let Some(sheet) = &v.sheet {
                 entry["sheet"] = json!(sheet);
             }
             if let Some(pos) = &v.pos {
-                entry["x"] = json!(pos.x);
-                entry["y"] = json!(pos.y);
+                entry["pos"] = json!({ "x": pos.x, "y": pos.y });
             }
             entry
         })

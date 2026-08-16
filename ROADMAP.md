@@ -39,11 +39,6 @@ Opening an issue is the best way to influence priority.
 Verified against the source on 2026-08-16. Listed because these tools' descriptions
 currently promise more than their handlers deliver.
 
-- **`run_erc` always reports zero.** `cli.rs::parse_erc_json` reads a top-level
-  `violations` array, but `kicad-cli sch erc` nests violations under `sheets[]`
-  (top-level `violations` exists only in the *DRC* report). Confirmed live: a
-  schematic where `kicad-cli` reports 7 violations comes back clean. Until fixed,
-  use `find_single_pin_nets` / `find_shorted_nets` / `find_orphan_items`.
 - **`set_layer_constraints`** writes a structure KiCAD won't read back — avoid.
 - **`assign_net_to_class`** was missed by the `.kicad_pro` migration and still
   reads/writes only the legacy `(net_class …)` block, so it is inert on KiCAD 7+ boards.
@@ -75,6 +70,14 @@ currently promise more than their handlers deliver.
 
 ## Done
 
+- ~~ERC reporting~~ — `run_erc` used to report every schematic clean:
+  `parse_erc_json` read a top-level `violations` array, but the ERC report has
+  none — violations are nested under `sheets[]`, and only the enclosing sheet
+  carries the sheet name (top-level `violations` is the *DRC* report's shape).
+  Violations now also surface their machine-readable `type` and their `items[]`
+  with per-item positions and uuids, matching `run_drc`'s output so one caller
+  can handle both. Verified live on a schematic where `kicad-cli` reports 7
+  violations: 0 → 7, each attributed to its sheet.
 - ~~Auto-routing~~ — `autoroute` runs a full Freerouting pipeline: Specctra DSN
   export via KiCAD's bundled `pcbnew` Python module (`kicad-cli` dropped DSN/SES
   in KiCAD 10), Freerouting headless, then SES import back into the board. Forced
