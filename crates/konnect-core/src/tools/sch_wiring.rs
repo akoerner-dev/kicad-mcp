@@ -722,7 +722,7 @@ async fn handle_delete_net_label(
     // Find ALL label occurrences with this net name, then pick the closest to (target_x, target_y).
     // This handles the common case of multiple labels on the same net.
     let search = format!(r#""{net}""#);
-    let label_starts_patterns = ["(net_label", "(global_label", "(hierarchical_label"];
+    let label_starts_patterns = ["(label ", "(global_label", "(hierarchical_label"];
 
     let mut best_start = None;
     let mut best_dist = f64::MAX;
@@ -799,7 +799,7 @@ async fn handle_rotate_label(
         .find(&search)
         .ok_or_else(|| anyhow::anyhow!("Label '{}' not found", net))?;
     let before = &content[..found];
-    let label_start = ["(net_label", "(global_label", "(hierarchical_label"]
+    let label_start = ["(label ", "(global_label", "(hierarchical_label"]
         .iter()
         .filter_map(|s| before.rfind(s))
         .max()
@@ -1273,4 +1273,125 @@ async fn handle_add_schematic_connection(
     Ok(CallToolResult::json(&json!({
         "connected": { "from": [x1, y1], "to": [x2, y2] }
     })))
+}
+
+#[cfg(test)]
+mod label_delete_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// A schematic with a leading global label, one plain local `(label ...)`,
+    /// and two stacked local labels sharing a position but differing in name —
+    /// the exact shape that produced the `multiple_net_names` ERC violation on
+    /// the ClearBell Ausseneinheit. Note the local-label token is `(label`,
+    /// never `(net_label` (which KiCad does not emit).
+    fn fixture() -> String {
+        r#"(kicad_sch
+	(global_label "SD_Card_CMD"
+		(at 100 100 0)
+		(effects (font (size 1.27 1.27)))
+		(uuid "dddddddd-dddd-dddd-dddd-dddddddddddd")
+	)
+	(label "Net-(J_SPK1-Pin_1)"
+		(at 194.31 194.31 180)
+		(effects (font (size 1.27 1.27)) (justify right bottom))
+		(uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	)
+	(label "unconnected-(IC1-NC-Pad17)_4"
+		(at 267.97 134.62 270)
+		(effects (font (size 1.27 1.27)) (justify right bottom))
+		(uuid "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+	)
+	(label "unconnected-(IC1-NC-Pad17)_6"
+		(at 267.97 134.62 270)
+		(effects (font (size 1.27 1.27)) (justify right bottom))
+		(uuid "cccccccc-cccc-cccc-cccc-cccccccccccc")
+	)
+)
+"#
+        .to_string()
+    }
+
+    /// Regression: `delete_schematic_net_label` must locate a plain local
+    /// `(label ...)` block. The old pattern list searched for a non-existent
+    /// `(net_label` token, so on this fixture it would instead match the
+    /// preceding `(global_label` and delete the wrong element.
+    #[tokio::test]
+    async fn deletes_local_label_and_leaves_preceding_global_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let sch = dir.path().join("s.kicad_sch");
+        std::fs::write(&sch, fixture()).unwrap();
+
+        let ctx = test_ctx();
+        handle_delete_net_label(
+            &json!({
+                "schematic": sch.display().to_string(),
+                "net": "Net-(J_SPK1-Pin_1)",
+                "x": 194.31, "y": 194.31
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let out = std::fs::read_to_string(&sch).unwrap();
+        assert!(
+            !out.contains("Net-(J_SPK1-Pin_1)"),
+            "the targeted local label should be gone"
+        );
+        assert!(
+            out.contains("SD_Card_CMD"),
+            "the preceding global label must be untouched"
+        );
+        assert!(out.contains("unconnected-(IC1-NC-Pad17)_4"));
+        assert!(out.contains("unconnected-(IC1-NC-Pad17)_6"));
+    }
+
+    /// Two local labels share a coordinate but differ in name; the tool must
+    /// remove only the name-matched one — this is the `multiple_net_names` fix.
+    #[tokio::test]
+    async fn discriminates_stacked_local_labels_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let sch = dir.path().join("s.kicad_sch");
+        std::fs::write(&sch, fixture()).unwrap();
+
+        let ctx = test_ctx();
+        handle_delete_net_label(
+            &json!({
+                "schematic": sch.display().to_string(),
+                "net": "unconnected-(IC1-NC-Pad17)_4",
+                "x": 267.97, "y": 134.62
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let out = std::fs::read_to_string(&sch).unwrap();
+        assert!(
+            !out.contains("unconnected-(IC1-NC-Pad17)_4"),
+            "the name-matched stacked label should be removed"
+        );
+        assert!(
+            out.contains("unconnected-(IC1-NC-Pad17)_6"),
+            "the stacked sibling with a different name must survive"
+        );
+        assert!(out.contains("SD_Card_CMD"), "global label kept");
+        assert!(out.contains("Net-(J_SPK1-Pin_1)"), "unrelated local label kept");
+    }
 }
