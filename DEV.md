@@ -43,12 +43,12 @@ Konnect/
 │   │   └── src/
 │   │       ├── mcp/
 │   │       │   ├── protocol.rs      # MCP JSON-RPC 2.0 types
-│   │       │   ├── handler.rs       # Dispatch: initialize, tools/list (all tools static), tools/call
+│   │       │   ├── handler.rs       # Dispatch: initialize, tools/list (meta-tools + loaded toolsets), tools/call
 │   │       │   └── server.rs        # Session state machine
 │   │       ├── router/
 │   │       │   ├── mod.rs           # ToolRouter: load/unload toolsets
 │   │       │   ├── registry.rs      # Static toolset metadata + tools_for() dispatcher
-│   │       │   └── meta_tools.rs    # 4 always-visible meta-tools
+│   │       │   └── meta_tools.rs    # 6 always-visible meta-tools (4 routing + 2 observability)
 │   │       └── tools/
 │   │           ├── mod.rs            # ToolDef, ToolContext, tool! macro, helpers, kicad_config_dir(), resolve_lib_symbol()
 │   │           ├── cli.rs            # kicad-cli v10 subprocess wrapper (verified against actual binary)
@@ -61,8 +61,8 @@ Konnect/
 │   │           ├── sch_export.rs     # 6 tools (SVG/PDF/netlist/ERC)
 │   │           ├── sch_hierarchy.rs  # 12 tools (typed Sheet model, sheet CRUD + hierarchy/page queries + pin lifecycle)
 │   │           ├── pcb_board.rs      # 11 tools (S-expr file editing, IPC fallback, SVG logo import)
-│   │           ├── pcb_components.rs # 15 tools (IPC real-time via NNG+protobuf)
-│   │           ├── pcb_routing.rs    # 13 tools (traces, vias, nets, netclasses, ratsnest)
+│   │           ├── pcb_components.rs # 16 tools (IPC real-time via NNG+protobuf; pad nets, F8 sync, teardrops)
+│   │           ├── pcb_routing.rs    # 14 tools (traces, vias, nets, netclasses, ratsnest, teardrop zones)
 │   │           ├── pcb_export.rs     # 13 tools (Gerber, PDF, 3D, DRC, DXF/GenCAD/IPC-2581/ODB++)
 │   │           ├── library.rs        # 14 tools (symbol/footprint library management)
 │   │           ├── integration.rs    # 9 tools (JLCPCB SQLite, Freerouting, datasheets)
@@ -172,7 +172,7 @@ if !path.exists() {
 
 Adding a new kind: edit `mcp/error.rs`, add the variant, add the match arm in `short_code()`, use it from the handler. The `short_code_matches_serialized_kind_field` test will fail loudly if they drift.
 
-The dispatch-level errors (not-loaded/unknown/handler-panic) are fully structured. So are **all missing-argument errors** across all 171 tools — `tools/mod.rs::require_str` / `require_f64` emit `ToolErrorKind::InvalidArgument { field, reason }` automatically. Most in-handler errors still use `CallToolResult::error("free text")` or bubble `anyhow::Error`; migrating them is incremental. `project.rs::handle_get_project_info` demonstrates the structured `FileNotFound` pattern.
+The dispatch-level errors (not-loaded/unknown/handler-panic) are fully structured. So are **all missing-argument errors** across all 190 tools — `tools/mod.rs::require_str` / `require_f64` emit `ToolErrorKind::InvalidArgument { field, reason }` automatically. Most in-handler errors still use `CallToolResult::error("free text")` or bubble `anyhow::Error`; migrating them is incremental. `project.rs::handle_get_project_info` demonstrates the structured `FileNotFound` pattern.
 
 ## Observability
 
@@ -193,9 +193,9 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 171 tools in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 190 tools in `tools/list` by default — that would cost ~25K tokens of context on every listing. Instead:
 
-- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`, `pcb_routing`. Combined with the 6 meta-tools, baseline `tools/list` is ~32 tools ≈ 3.5K tokens.
+- **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project` (6), `config` (7), `pcb_routing` (14) = 27 tools. Combined with the 6 meta-tools, baseline `tools/list` is 33 tools ≈ 3.5K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
 - **`tools/list_changed` notification**: sent on every load/unload so MCP clients refresh their local tool cache. Not every client acts on this — one observed client only reads `tools/list` at connection time and never revisits it, leaving runtime-loaded toolsets permanently unreachable there. `pcb_routing` is in the starter kit specifically to route around that gap for the toolset that hits it most.
 - **Error recovery**: if the LLM calls an unloaded tool, `handler.rs` returns an actionable error naming the toolset that owns it (so the LLM can load it and retry in one hop — no extra `list_toolboxes` round-trip).
@@ -249,8 +249,8 @@ convention for other `kicad-cli`-calling code.
 ## Current Stats
 
 - **18 toolsets, 190 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
-- Baseline `tools/list`: ~32 tools / ~3.5K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): ~194 tools / ~25K tokens
+- Baseline `tools/list`: 33 tools / ~3.5K tokens (starter kit 27 + 6 meta-tools)
+- Full-catalog `tools/list` (all loaded): 196 tools / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
-- **0 unimplemented tools**
+- **0 `todo!()` / `unimplemented!()` tools** — every registered tool dispatches to a real handler. This counts implementation *presence*, not feature completeness: `move_connected` currently delegates to the plain move (wire stretching is a planned enhancement), and `place_component` emits a footprint stub without pad geometry (see Known Gaps in `ROADMAP.md`).
 - **3 CLI commands removed in KiCAD v10:** `pcb sync` (no workaround — returns a clear error pointing at the GUI's Update PCB from Schematic); specctra DSN export + SES import (worked around in `autoroute` via KiCAD's bundled `pcbnew` Python module instead of `kicad-cli` — see `integration.rs`)

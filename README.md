@@ -33,9 +33,11 @@ against a real board via `kicad-cli`.
 | **Footprint rotation-sign fix** | `find_pad_board_position` (used by `route_pad_to_pad`) and `get_component_pads` applied a rotation transform with the wrong sign — invisible at 0°/180° (the sign only enters through `sin`), but silently returned the *other* pad's position on any 90°/270°-rotated footprint. Found while verifying the tool above against a live `kicad-cli` DRC report; fixed with a regression test encoding the real rotated footprint that exposed it. | A latent correctness bug in already-shipped tooling — `route_pad_to_pad` could have routed to the wrong pad on a rotated footprint. |
 | **Starter-kit toolset tuning** | Pre-loads `pcb_routing` at server startup instead of only via runtime `load_toolset`. | Traced a real MCP client that reads `tools/list` once at connection and never revisits it — confirmed server-side `list_changed` notifications fire correctly after `load_toolset`, so this routes around a client-side gap rather than a server bug. |
 | **`autoroute`** | Full auto-routing pipeline: exports the board to Specctra DSN via KiCAD's bundled `pcbnew` Python module (not `kicad-cli`, which dropped DSN/SES support in KiCAD 10), runs Freerouting headless, and imports the routed session back into the board. Single-threaded route optimization is forced (`-mt 1`) since Freerouting's own multi-threaded optimizer is documented to generate clearance violations; the subprocess wrapper is `kill_on_drop`-safe so a timed-out run can't leak an orphaned `java`/`python` process. Verified live against a real board (239→254 trace segments; independent `kicad-cli` DRC afterward: 0 unconnected). | `autoroute` was a dead stub returning "not supported" ever since `kicad-cli` dropped Specctra DSN/SES export/import in KiCAD 10 — this closes the auto-routing roadmap's last "open core" gap without reimplementing the DSN/SES file format by hand. |
+| **Modern design-rule storage** | `set_design_rules` / `get_design_rules` / `create_netclass` now fall back to the sibling `.kicad_pro` JSON (`board.design_settings.rules`, `net_settings.classes[]`) when a board carries no legacy `(net_class …)` block, with `serde_json`'s `preserve_order` so a one-field change stays a one-line diff. `create_netclass` became a true upsert — it overwrites only the fields actually passed. | KiCad 7+ moved constraints and netclasses out of the `.kicad_pcb` entirely, so on every modern board these tools were writing to a location KiCad never reads — silently doing nothing. Surfaced by a real rule conflict (netclass 0.2 mm vs. board minimum 0.3 mm) that produced 199 track-width violations after an otherwise clean routing run. |
+| **`set_pad_teardrop` + `delete_teardrop_zone`** | Teardrop fillets are `(zone …)` blocks KiCad regenerates from a per-pad setting on every save, and they carry no `uuid` — so `delete_trace` can't target them. `set_pad_teardrop` flips the per-pad setting (stops regeneration); `delete_teardrop_zone` locates the existing zone by net name plus a point from its own polygon (exactly the `pos` a DRC violation reports) and removes it. | After widening traces at a 1.27 mm-pitch IC, newly recomputed teardrops collided with neighbouring pads (0.1905 mm vs. 0.2 mm required) — a clearance failure no existing tool could reach. The two are only effective together: suppressing the setting alone leaves the already-generated zone in place. |
 | **Windows build chain** | GNU-toolchain build recipe + [`BUILD_NOTES_WINDOWS.md`](BUILD_NOTES_WINDOWS.md). | Upstream targeted Unix; getting the `nng`/protobuf stack building under MinGW took real work. |
 
-**Full tool catalogue:** [`tool-directory.md`](tool-directory.md) — 18 on-demand toolsets, ~194 tools.
+**Full tool catalogue:** [`tool-directory.md`](tool-directory.md) — 18 toolsets (3 pre-loaded, 15 on-demand), 190 tools + 6 meta-tools.
 
 ### Design notes worth reading (the interesting part)
 
@@ -105,10 +107,12 @@ dialog open** (KiCad answers `AS_BUSY` while one is). File-based tools (includin
 ```
 crates/
   konnect              MCP server binary (stdio/HTTP transport, router, extension install)
-  konnect-core         Tool implementations, grouped into on-demand toolsets
+  konnect-core         Tool implementations, grouped into toolsets (3 pre-loaded, 15 on-demand)
     src/tools/netlist.rs        ← netlist parse + board diff (my work; pure, unit-tested)
-    src/tools/pcb_components.rs  ← set_pad_net, update_pcb_from_schematic (my work)
-    src/tools/cli.rs, verification.rs ← patched DRC pipeline (my work)
+    src/tools/pcb_components.rs  ← set_pad_net, update_pcb_from_schematic, set_pad_teardrop (my work)
+    src/tools/pcb_routing.rs     ← get_unrouted_connections, delete_teardrop_zone (my work)
+    src/tools/integration.rs     ← autoroute: pcbnew DSN/SES bridge + Freerouting (my work)
+    src/tools/cli.rs, verification.rs ← patched DRC pipeline + .kicad_pro rule fallback (my work)
   konnect-sexp         Format-preserving S-expression reader/writer + atomic file writes
   konnect-ipc          KiCad 10 IPC client (protobuf over NNG)
   konnect-schematic-editor   .kicad_sch editing engine
