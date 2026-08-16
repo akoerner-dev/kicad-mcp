@@ -175,6 +175,21 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_set_pad_net(args, ctx).await }
         ),
         tool!(
+            "set_pad_teardrop",
+            "Enable or disable the teardrop fillet for a single pad on a footprint, by rewriting the pad's (teardrops (enabled ...)) entry directly in the .kicad_pcb (S-expression edit, no KiCAD IPC required). Teardrops are not separately-deletable objects — KiCAD regenerates each teardrop zone from this per-pad setting on save/DRC-refill — so this is the only way to suppress one. Use it to resolve a clearance violation between a pad's auto-generated teardrop and a neighboring pad/track at tight pin pitch, without disabling teardrops board-wide. After calling, re-run DRC with refill_zones to see the effect; if KiCAD has the board open, revert/reload it to see the change.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string" },
+                    "reference": { "type": "string", "description": "Reference designator, e.g. 'IC1'" },
+                    "pad":       { "type": "string", "description": "Pad number/name as written in the footprint, e.g. '30'" },
+                    "enabled":   { "type": "boolean", "description": "true = allow a teardrop at this pad, false = suppress it" }
+                },
+                "required": ["board", "reference", "pad", "enabled"]
+            }),
+            |args, ctx| async move { handle_set_pad_teardrops(args, ctx).await }
+        ),
+        tool!(
             "update_pcb_from_schematic",
             "File-based 'Update PCB from Schematic' (KiCAD's F8) for connectivity: exports the schematic's netlist with kicad-cli, then rewrites every board pad's (net ...) and each footprint's Value to match the schematic — the authoritative source — directly in the .kicad_pcb (S-expression edits, no KiCAD IPC). This closes board-vs-schematic net parity in one pass (a bulk set_pad_net). It does NOT add, delete, or refootprint components (that needs library geometry / IPC) or move copper — such cases are reported as warnings, not applied. Defaults to dry_run=true: returns the full diff without touching the file. Set dry_run=false to apply. After applying, re-run DRC; if KiCAD has the board open, revert/reload it.",
             json!({
@@ -657,6 +672,115 @@ async fn handle_set_pad_net(
         "net_code": net_code,
         "old_net": old_net,
         "note": "Pad net rewritten in the .kicad_pcb. Copper was not moved — re-run DRC to verify. If KiCAD has the board open, revert/reload it to see the change."
+    })))
+}
+
+async fn handle_set_pad_teardrops(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let pad_number = match require_str(args, "pad") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let enabled = match args.get("enabled").and_then(|v| v.as_bool()) {
+        Some(v) => v,
+        None => {
+            return Ok(CallToolResult::error(
+                "Missing required boolean argument: enabled".to_string(),
+            ))
+        }
+    };
+
+    let content = std::fs::read_to_string(&board_path)?;
+
+    let (fp_start, fp_end) = match locate_fp_block(&content, &reference) {
+        Some(r) => r,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Footprint '{}' not found",
+                reference
+            )))
+        }
+    };
+
+    // Trailing space keeps pad "1" from matching pad "10".
+    let pad_pat = format!("(pad \"{}\" ", pad_number);
+    let pad_pos = match content[fp_start..fp_end].find(&pad_pat) {
+        Some(p) => fp_start + p,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Pad '{}' not found on footprint '{}'",
+                pad_number, reference
+            )))
+        }
+    };
+    let (pad_start, pad_end) = match find_balanced_block(&content, pad_pos) {
+        Some(r) => r,
+        None => return Ok(CallToolResult::error("Unbalanced pad block".to_string())),
+    };
+
+    let new_value = if enabled { "yes" } else { "no" };
+
+    let edit = match content[pad_start..pad_end].find("(teardrops") {
+        Some(td_rel) => {
+            let td_abs = pad_start + td_rel;
+            let (td_start, td_end) = match find_balanced_block(&content, td_abs) {
+                Some(r) => r,
+                None => {
+                    return Ok(CallToolResult::error(
+                        "Unbalanced (teardrops ...) block on pad".to_string(),
+                    ))
+                }
+            };
+            match content[td_start..td_end].find("(enabled ") {
+                Some(en_rel) => {
+                    let en_abs = td_start + en_rel;
+                    let (en_start, en_end) = match find_balanced_block(&content, en_abs) {
+                        Some(r) => r,
+                        None => {
+                            return Ok(CallToolResult::error(
+                                "Unbalanced (enabled ...) node in teardrops block".to_string(),
+                            ))
+                        }
+                    };
+                    let old = content[en_start..en_end].to_string();
+                    let new = format!("(enabled {new_value})");
+                    if old == new {
+                        return Ok(CallToolResult::json(&json!({
+                            "reference": reference,
+                            "pad": pad_number,
+                            "enabled": enabled,
+                            "unchanged": true,
+                            "note": "Teardrop already set to this state."
+                        })));
+                    }
+                    SexpEdit::replace(en_start, en_end, new)
+                }
+                // A (teardrops ...) block exists but has no explicit (enabled ...)
+                // node (not seen in practice, but KiCAD's grammar allows omitting
+                // it) — insert one rather than erroring.
+                None => SexpEdit::insert(td_end - 1, format!(" (enabled {new_value})")),
+            }
+        }
+        // No (teardrops ...) block at all on this pad: insert a minimal one.
+        // KiCAD fills in the remaining teardrop parameters with its defaults.
+        None => SexpEdit::insert(pad_end - 1, format!(" (teardrops (enabled {new_value}))")),
+    };
+
+    let new_content = apply_edits(content, vec![edit]);
+    write_atomic(&board_path, &new_content)?;
+
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "pad": pad_number,
+        "enabled": enabled,
+        "note": "Pad teardrop setting rewritten in the .kicad_pcb. Teardrop zones are regenerated on save/DRC-refill, not stored separately — re-run DRC with refill_zones to confirm. If KiCAD has the board open, revert/reload it to see the change."
     })))
 }
 
@@ -1254,5 +1378,149 @@ mod update_from_schematic_tests {
             "after applying, a dry run must find no more pad-net changes"
         );
         assert_eq!(second["would_change"]["values"], json!(0));
+    }
+}
+
+#[cfg(test)]
+mod set_pad_teardrop_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// Board with a pad carrying a full (teardrops ...) block, mirroring what
+    /// real KiCAD-10 footprints look like (the case this tool exists for).
+    fn board_with_teardrop_block() -> String {
+        r#"(kicad_pcb
+  (footprint "QFN" (layer "F.Cu")
+    (property "Reference" "IC1" (at 0 0))
+    (pad "30" smd rect (at 8.75 4.9 90) (size 1.5 0.9)
+      (net "SD_Card_CLK")
+      (teardrops
+        (best_length_ratio 0.5)
+        (max_length 1)
+        (enabled yes)
+        (allow_two_segments yes)
+      )
+      (uuid "3d87484b-809f-4cab-88b1-4983df0e83a2")
+    )
+    (pad "31" smd rect (at 8.75 3.63 90) (size 1.5 0.9)
+      (net "SD_Card_DAT0")
+      (uuid "aaaa1111-0000-0000-0000-000000000000")
+    )
+  )
+)
+"#
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn disables_teardrop_on_pad_with_existing_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        std::fs::write(&board, board_with_teardrop_block()).unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_set_pad_teardrops(
+            &json!({ "board": board.to_str().unwrap(), "reference": "IC1", "pad": "30", "enabled": false }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let r = body(&result);
+        assert_eq!(r["enabled"], json!(false));
+        assert_eq!(r.get("unchanged"), None);
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert!(
+            updated.contains("(enabled no)"),
+            "pad 30's teardrop should now be disabled"
+        );
+        assert!(
+            !updated.contains("(enabled yes)"),
+            "the old (enabled yes) must be gone, not left behind as a duplicate"
+        );
+        // The best_length_ratio sibling param must survive untouched.
+        assert!(updated.contains("(best_length_ratio 0.5)"));
+    }
+
+    #[tokio::test]
+    async fn setting_already_matching_state_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        std::fs::write(&board, board_with_teardrop_block()).unwrap();
+        let ctx = test_ctx();
+        let before = std::fs::read_to_string(&board).unwrap();
+
+        let result = handle_set_pad_teardrops(
+            &json!({ "board": board.to_str().unwrap(), "reference": "IC1", "pad": "30", "enabled": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let r = body(&result);
+        assert_eq!(r["unchanged"], json!(true));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), before, "file must be byte-identical when nothing changed");
+    }
+
+    /// Pad 31 has no (teardrops ...) block at all — the tool must insert a
+    /// minimal one rather than erroring, since that's the realistic case for
+    /// any pad that never had a per-pad override.
+    #[tokio::test]
+    async fn inserts_minimal_block_when_pad_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        std::fs::write(&board, board_with_teardrop_block()).unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_set_pad_teardrops(
+            &json!({ "board": board.to_str().unwrap(), "reference": "IC1", "pad": "31", "enabled": false }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let r = body(&result);
+        assert_eq!(r["enabled"], json!(false));
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert!(updated.contains("(teardrops (enabled no))"));
+        // Pad 30's own block must be untouched by editing pad 31.
+        assert!(updated.contains("(enabled yes)"));
+    }
+
+    #[tokio::test]
+    async fn unknown_pad_errors_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        std::fs::write(&board, board_with_teardrop_block()).unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_set_pad_teardrops(
+            &json!({ "board": board.to_str().unwrap(), "reference": "IC1", "pad": "99", "enabled": false }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
     }
 }

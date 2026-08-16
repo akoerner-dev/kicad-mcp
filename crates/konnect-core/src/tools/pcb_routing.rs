@@ -7,7 +7,7 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::client::KiCadIpcClient;
-use konnect_sexp::writer::{apply_edits, new_uuid, write_atomic, SexpEdit};
+use konnect_sexp::writer::{apply_edits, find_balanced_block, new_uuid, write_atomic, SexpEdit};
 use serde_json::json;
 
 use super::cli;
@@ -166,6 +166,21 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["board", "net_name", "layer", "points"]
             }),
             |args, ctx| async move { handle_add_copper_pour(args, ctx).await }
+        ),
+        tool!(
+            "delete_teardrop_zone",
+            "Delete a single auto-generated teardrop zone directly from the .kicad_pcb (S-expression edit, no KiCAD IPC required). KiCAD teardrops are `(zone ...)` blocks tagged `(attr (teardrop ...))` with no uuid, so they can't be targeted with delete_trace — this instead matches by net name plus a point from the zone's own polygon (pass the exact 'pos' reported for that teardrop by run_drc or get_unrouted_connections). Use this together with set_pad_teardrop(enabled: false) on the owning pad: disabling the setting alone only stops future regeneration, it does not remove an already-existing teardrop zone from the file. After calling, re-run DRC to confirm; if KiCAD has the board open, revert/reload it to see the change.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":    { "type": "string" },
+                    "net_name": { "type": "string", "description": "Net the teardrop zone belongs to, e.g. from the DRC violation's 'Teardrop [NET]' item" },
+                    "x":        { "type": "number", "description": "X of a point on the zone's polygon — the violation's reported pos.x works" },
+                    "y":        { "type": "number", "description": "Y of a point on the zone's polygon — the violation's reported pos.y works" }
+                },
+                "required": ["board", "net_name", "x", "y"]
+            }),
+            |args, ctx| async move { handle_delete_teardrop_zone(args, ctx).await }
         ),
         tool!(
             "delete_trace",
@@ -558,6 +573,82 @@ async fn handle_add_copper_pour(
     Ok(CallToolResult::json(
         &json!({ "net": net_name, "layer": layer, "points": pts.len() }),
     ))
+}
+
+/// Find every `(zone ...)` block in `content`, balanced-paren delimited.
+fn find_zone_blocks(content: &str) -> Vec<(usize, usize)> {
+    let mut blocks = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = content[search_from..].find("(zone") {
+        let abs = search_from + rel;
+        // Skip matches on tokens like "(zone_connect" — "(zone" must be
+        // followed by whitespace or '(' to be the block keyword itself.
+        let after = content[abs + 5..].chars().next();
+        if !matches!(after, Some(c) if c.is_whitespace()) {
+            search_from = abs + 5;
+            continue;
+        }
+        match find_balanced_block(content, abs) {
+            Some((s, e)) => {
+                blocks.push((s, e));
+                search_from = e;
+            }
+            None => break,
+        }
+    }
+    blocks
+}
+
+async fn handle_delete_teardrop_zone(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let net_name = match require_str(args, "net_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let x = match require_f64(args, "x") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y = match require_f64(args, "y") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+
+    let content = std::fs::read_to_string(&board_path)?;
+    let net_pat = format!("(net \"{net_name}\")");
+    let needle = format!("{x} {y}"); // matches an "(xy X Y)" polygon point verbatim.
+
+    let mut matches: Vec<(usize, usize)> = find_zone_blocks(&content)
+        .into_iter()
+        .filter(|&(s, e)| {
+            let block = &content[s..e];
+            block.contains(&net_pat) && block.contains("(teardrop") && block.contains(&needle)
+        })
+        .collect();
+
+    match matches.len() {
+        0 => Ok(CallToolResult::error(format!(
+            "No teardrop zone found on net '{net_name}' with a polygon point at ({x}, {y}). \
+             Pass the exact 'pos' a DRC violation reported for this teardrop."
+        ))),
+        1 => {
+            let (zs, ze) = matches.remove(0);
+            let new_content = apply_edits(content, vec![SexpEdit::replace(zs, ze, String::new())]);
+            write_atomic(&board_path, &new_content)?;
+            Ok(CallToolResult::json(&json!({
+                "net": net_name,
+                "x": x,
+                "y": y,
+                "note": "Teardrop zone removed from the .kicad_pcb. If KiCAD has the board open, revert/reload it to see the change."
+            })))
+        }
+        n => Ok(CallToolResult::error(format!(
+            "Ambiguous: {n} teardrop zones on net '{net_name}' match a polygon point at ({x}, {y}). Refusing to guess."
+        ))),
+    }
 }
 
 async fn handle_delete_trace(
@@ -1596,5 +1687,141 @@ mod netclass_json_tests {
         assert_eq!(body["clearance"], 0.15);
         assert_eq!(body["via_drill"], 0.3);
         assert_eq!(body["via_diameter"], 0.6);
+    }
+}
+
+#[cfg(test)]
+mod delete_teardrop_zone_tests {
+    use super::*;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// Mirrors the actual shape found in a real KiCad 10 board (ClearBell
+    /// Ausseneinheit, 2026-08-16): a teardrop zone has no uuid, is tagged
+    /// `(attr (teardrop (type padvia)))`, and its polygon's first point is
+    /// exactly what DRC reports as the violation's `pos`. Two such zones plus
+    /// one ordinary (non-teardrop) GND pour, so a naive "first zone on this
+    /// net" match would pick the wrong one.
+    const SAMPLE_BOARD: &str = r#"(kicad_pcb
+  (zone
+    (net "GND")
+    (layer "F.Cu")
+    (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10)))
+  )
+  (zone
+    (net "SD_Card_CLK")
+    (layer "F.Cu")
+    (attr (teardrop (type padvia)))
+    (polygon (pts (xy 103.842632 89.674264) (xy 104.054764 89.462132) (xy 103.81 88.793104)))
+  )
+  (zone
+    (net "SD_Card_DAT0")
+    (layer "F.Cu")
+    (attr (teardrop (type padvia)))
+    (polygon (pts (xy 102.572632 89.674264) (xy 102.784764 89.462132) (xy 102.54 88.793104)))
+  )
+)
+"#;
+
+    #[tokio::test]
+    async fn deletes_only_the_matching_teardrop_zone() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAMPLE_BOARD).unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_delete_teardrop_zone(
+            &json!({
+                "board": board.to_str().unwrap(),
+                "net_name": "SD_Card_CLK",
+                "x": 103.842632,
+                "y": 89.674264
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", body(&result));
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert!(
+            !updated.contains("SD_Card_CLK"),
+            "the matched teardrop zone must be gone"
+        );
+        // The GND pour and the other net's teardrop must survive untouched.
+        assert!(updated.contains("\"GND\""));
+        assert!(updated.contains("SD_Card_DAT0"));
+        assert!(updated.contains("102.572632 89.674264"));
+    }
+
+    #[tokio::test]
+    async fn no_matching_point_errors_instead_of_guessing() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        std::fs::write(&board, SAMPLE_BOARD).unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_delete_teardrop_zone(
+            &json!({
+                "board": board.to_str().unwrap(),
+                "net_name": "SD_Card_CLK",
+                "x": 0.0,
+                "y": 0.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(updated, SAMPLE_BOARD, "a failed match must not touch the file");
+    }
+
+    /// A non-teardrop zone on the same net, at the same point, must never be
+    /// treated as a match — only `(attr (teardrop ...))` zones are eligible.
+    #[tokio::test]
+    async fn plain_zone_without_teardrop_attr_is_not_a_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        std::fs::write(
+            &board,
+            r#"(kicad_pcb
+  (zone
+    (net "GND")
+    (layer "F.Cu")
+    (polygon (pts (xy 5 5) (xy 6 6)))
+  )
+)
+"#,
+        )
+        .unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_delete_teardrop_zone(
+            &json!({ "board": board.to_str().unwrap(), "net_name": "GND", "x": 5.0, "y": 5.0 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
     }
 }

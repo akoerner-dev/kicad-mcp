@@ -198,7 +198,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
-### `pcb_components` · 15 tools
+### `pcb_components` · 16 tools
 **Purpose:** Place, move, rotate, align, and duplicate PCB footprints; sync pad nets/values from the schematic.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
@@ -213,6 +213,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_component_pads` | Return pad positions and net assignments for a footprint. |
 | `get_pad_position` | Return the schematic-space position of a specific pad number on a footprint. |
 | `set_pad_net` | Reassign the net of a single pad by rewriting its `(net ...)` entry (S-expression edit; format-preserving, no IPC). Fixes a stale/swapped pad-net without the GUI. |
+| `set_pad_teardrop` | Enable/disable the teardrop fillet for a single pad by rewriting its `(teardrops (enabled ...))` entry (S-expression edit, no IPC). Teardrops aren't separately-deletable objects — this is the only way to suppress one at a specific pad, e.g. to clear a clearance violation at tight pin pitch without disabling teardrops board-wide. |
 | `update_pcb_from_schematic` | File-based "Update PCB from Schematic" (F8) for connectivity: bulk-rewrites every pad net and footprint Value to match the schematic's exported netlist (S-expression edits, no IPC). Reports (does not apply) component add/delete/refootprint. Defaults to dry_run. |
 | `get_component_list` | List all footprints on the board with positions, layers, and values. |
 | `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
@@ -220,7 +221,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the PCB as a 2D image using kicad-cli; returns base64 PNG. |
 
-### `pcb_routing` · 13 tools
+### `pcb_routing` · 14 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, ratsnest.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
@@ -231,6 +232,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
 | `add_via` | Add a through-hole via at a position and assign it to a net via IPC. |
 | `add_copper_pour` | Add a copper fill zone polygon on a layer/net via S-expression insert. |
+| `delete_teardrop_zone` | Delete a single auto-generated teardrop zone by net name + a point from its own polygon (S-expression edit, no IPC). Teardrops have no uuid so `delete_trace` can't target them; pair with `set_pad_teardrop` on the owning pad to also stop it regenerating. |
 | `delete_trace` | Delete a trace segment identified by its UUID via KiCAD IPC. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |
 | `get_nets_list` | Return all nets defined on the PCB via KiCAD IPC. |

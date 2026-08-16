@@ -76,13 +76,13 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_components",
         description: "Place, move, rotate, align, and duplicate PCB footprints; sync pad nets/values from schematic (F8)",
         category: "pcb",
-        tool_count: 15,
+        tool_count: 16,
     },
     ToolsetMeta {
         name: "pcb_routing",
         description: "Traces, vias, copper pours, net classes, differential pairs, ratsnest",
         category: "pcb",
-        tool_count: 13,
+        tool_count: 14,
     },
     ToolsetMeta {
         name: "pcb_export",

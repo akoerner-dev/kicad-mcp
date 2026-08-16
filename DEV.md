@@ -248,7 +248,7 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **18 toolsets, 188 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
+- **18 toolsets, 190 tools** + 6 meta-tools (4 routing + 2 observability — see `tool-directory.md`)
 - Baseline `tools/list`: ~32 tools / ~3.5K tokens (starter kit + meta-tools)
 - Full-catalog `tools/list` (all loaded): ~194 tools / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
