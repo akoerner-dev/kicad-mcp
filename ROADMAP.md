@@ -39,7 +39,11 @@ Opening an issue is the best way to influence priority.
 Verified against the source on 2026-08-16. Listed because these tools' descriptions
 currently promise more than their handlers deliver.
 
-- **`set_layer_constraints`** writes a structure KiCAD won't read back — avoid.
+- **`set_layer_constraints`** is now guarded: it used to splice `(rule …)` blocks
+  into the `.kicad_pcb` `(setup …)` section — invalid there, which corrupted the
+  board — so the handler now refuses with an error instead of writing. A real
+  implementation must target the sibling `<project>.kicad_dru` file; per-board
+  minimums already work via `set_design_rules`.
 - **`assign_net_to_class`** was missed by the `.kicad_pro` migration and still
   reads/writes only the legacy `(net_class …)` block, so it is inert on KiCAD 7+ boards.
 - **`move_connected`** delegates to the plain move; connected wires do not stretch.

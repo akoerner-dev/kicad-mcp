@@ -147,7 +147,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_layer_constraints",
-            "Set per-layer design constraints (e.g. min trace width, clearance) in the board setup section.",
+            "[DISABLED - do not use] Formerly set per-layer design constraints in the board (setup) section, \
+             but that syntax is invalid there and corrupted the board on the next save; it now refuses with \
+             an error and changes nothing. Use set_design_rules for global minimums (.kicad_pro on modern \
+             boards, board setup on legacy ones); per-layer/conditional rules require a .kicad_dru file, \
+             which is not yet supported.",
             json!({
                 "type": "object",
                 "properties": {
@@ -696,6 +700,74 @@ mod design_rules_json_tests {
     }
 }
 
+#[cfg(test)]
+mod set_layer_constraints_guard_tests {
+    use super::*;
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    /// The core safety property: the guard must never again mutate the board.
+    /// It used to splice invalid `(rule ...)` blocks into `(setup ...)`, which
+    /// corrupted the file on the next KiCAD save. Assert the .kicad_pcb is
+    /// byte-for-byte unchanged and the call is flagged is_error, so no caller
+    /// assumes the constraint was applied.
+    #[tokio::test]
+    async fn refuses_and_leaves_board_byte_for_byte_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let original = "(kicad_pcb (setup (pad_to_mask_clearance 0)))";
+        std::fs::write(&board, original).unwrap();
+
+        let args = json!({
+            "board": board.to_str().unwrap(),
+            "layer": "F.Cu",
+            "min_trace_width": 0.3,
+            "min_clearance": 0.2
+        });
+        let result = handle_set_layer_constraints(&args, &ctx()).await.unwrap();
+
+        assert!(result.is_error, "guarded tool must report is_error");
+        let after = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(after, original, "board file must be byte-for-byte unchanged");
+        assert!(!after.contains("(rule"), "no rule block may be inserted into setup");
+    }
+
+    /// The refusal message must keep naming the correct mechanism (.kicad_dru)
+    /// and the working alternative (set_design_rules), so the guidance survives
+    /// future edits to the string.
+    #[tokio::test]
+    async fn error_message_names_the_correct_mechanism() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (setup))").unwrap();
+
+        let args =
+            json!({ "board": board.to_str().unwrap(), "layer": "F.Cu", "min_trace_width": 0.3 });
+        let result = handle_set_layer_constraints(&args, &ctx()).await.unwrap();
+
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(text.contains(".kicad_dru"), "must name the correct file: {text}");
+        assert!(
+            text.contains("set_design_rules"),
+            "must name the working alternative: {text}"
+        );
+    }
+}
+
 // ─── KiCAD UI management ──────────────────────────────────────────────────────
 
 /// Check if the KiCAD GUI is running by scanning the process list.
@@ -1069,93 +1141,28 @@ fn reassign_uuids(content: &str, insert_boundary: usize) -> String {
 // ─── Layer constraints ───────────────────────────────────────────────────────
 
 async fn handle_set_layer_constraints(
-    args: &serde_json::Value,
+    _args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board = get_path(args, "board")?;
-    let layer = match require_str(args, "layer") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-    let mut content = tokio::fs::read_to_string(&board).await?;
-    let mut changed = Vec::new();
-
-    // Build a layer constraint rule block to insert into (setup ...)
-    // KiCAD uses `(rule "name" (constraint ...) (condition "A.Layer == 'LAYER'"))` inside setup
-    let rule_name = format!("{}_constraints", layer.replace('.', "_"));
-
-    if let Some(clearance) = args["min_clearance"].as_f64() {
-        let rule_sexp = format!(
-            "\n    (rule \"{rule_name}_clearance\"\n      (constraint clearance (min {clearance}))\n      (condition \"A.Layer == '{layer}'\")\n    )"
-        );
-        // Insert into setup block
-        if let Some(setup_pos) = content.find("(setup") {
-            let mut depth = 0i32;
-            let mut setup_end = setup_pos;
-            for (i, ch) in content[setup_pos..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            setup_end = setup_pos + i;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            content = format!(
-                "{}{}{}",
-                &content[..setup_end],
-                rule_sexp,
-                &content[setup_end..]
-            );
-            changed.push(format!("clearance = {} on {}", clearance, layer));
-        }
-    }
-
-    if let Some(trace_width) = args["min_trace_width"].as_f64() {
-        let rule_sexp = format!(
-            "\n    (rule \"{rule_name}_trace_width\"\n      (constraint track_width (min {trace_width}))\n      (condition \"A.Layer == '{layer}'\")\n    )"
-        );
-        if let Some(setup_pos) = content.find("(setup") {
-            let mut depth = 0i32;
-            let mut setup_end = setup_pos;
-            for (i, ch) in content[setup_pos..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            setup_end = setup_pos + i;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            content = format!(
-                "{}{}{}",
-                &content[..setup_end],
-                rule_sexp,
-                &content[setup_end..]
-            );
-            changed.push(format!("min_trace_width = {} on {}", trace_width, layer));
-        }
-    }
-
-    if !changed.is_empty() {
-        write_atomic(&board, &content)?;
-    }
-
-    Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
-            "success": true,
-            "layer": layer,
-            "changed": changed
-        }))
-        .unwrap(),
+    // GUARD (2026-08-17): this handler is intentionally inert.
+    //
+    // It used to splice `(rule "..." (constraint ...) (condition "A.Layer == '...'"))`
+    // blocks straight into the board's `(setup ...)` section. That is invalid:
+    // KiCAD stores custom, conditional design rules ONLY in the sibling
+    // `<project>.kicad_dru` file, never inside the `.kicad_pcb` `(setup ...)`.
+    // A `(rule ...)` block there violates the setup grammar, so KiCAD drops or
+    // rejects the content on the next load/save — i.e. the tool silently
+    // corrupted the board (confirmed against KiCAD 10 on 2026-08-16). Until a
+    // real `.kicad_dru` writer exists, refuse rather than touch the file, so no
+    // caller can trip the corruption. See ROADMAP.md "Known gaps".
+    Ok(CallToolResult::error(
+        "set_layer_constraints is disabled: it wrote per-layer (rule ...) blocks \
+         into the .kicad_pcb (setup) section, which is not valid there and \
+         corrupts the board on the next save. Per-layer / conditional constraints \
+         belong in the project's <name>.kicad_dru file, which this tool does not \
+         yet write. For global minimums (min track width, clearance, via size) use \
+         set_design_rules (it writes to the .kicad_pro project file, or the board \
+         setup on legacy boards).",
     ))
 }
 

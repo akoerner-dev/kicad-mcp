@@ -323,7 +323,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `check_kicad_ui` | Check whether the KiCAD GUI application is running and responsive. |
 | `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
 | `copy_routing_pattern` | Copy a routing pattern (traces and vias) from one region of the board to another. |
-| `set_layer_constraints` | Set per-layer design constraints (min trace width, clearance) in board setup. |
+| `set_layer_constraints` | **Disabled** — formerly wrote per-layer `(rule …)` blocks into the board `(setup)` section, which is invalid there and corrupted the board; now refuses with an error. Use `set_design_rules` for global minimums; per-layer rules need a `.kicad_dru` file (not yet supported). |
 | `check_clearance` | Check the physical clearance (distance) between two components on the PCB. |
 
 ---
