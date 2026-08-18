@@ -22,6 +22,12 @@ pub struct NlComp {
     pub reference: String,
     pub value: String,
     pub footprint: String,
+    /// All symbol fields carrying a non-empty value, in first-seen order
+    /// (e.g. MANUFACTURER_NAME, HEIGHT, Digi-Key_Part_Number, Description).
+    /// [`plan`] decides which of these to propagate onto the footprint; the
+    /// structural `Reference`/`Value`/`Footprint` fields are kept out of the
+    /// generic sync there.
+    pub fields: Vec<(String, String)>,
 }
 
 /// Parsed schematic netlist: components, the desired net of every pad, and the
@@ -46,10 +52,34 @@ pub fn parse_netlist(content: &str) -> anyhow::Result<Netlist> {
             if reference.is_empty() {
                 continue;
             }
+            // Symbol fields live under `(fields (field (name "X") "value") ...)`.
+            // The value is the bare string that follows the `(name ...)` node; a
+            // value-less field — `(field (name "Datasheet"))` — has none, so we
+            // drop it here and keep only fields that actually carry a value.
+            let mut fields = Vec::new();
+            if let Some(fields_node) = c.find("fields") {
+                for f in fields_node.find_all("field") {
+                    let Some(name) = f.find_str("name") else {
+                        continue;
+                    };
+                    let value = f
+                        .children()
+                        .unwrap_or(&[])
+                        .iter()
+                        .skip(1)
+                        .find_map(|n| n.as_str());
+                    if let Some(v) = value {
+                        if !v.is_empty() {
+                            fields.push((name.to_string(), v.to_string()));
+                        }
+                    }
+                }
+            }
             comps.push(NlComp {
                 reference,
                 value: c.find_str("value").unwrap_or("").to_string(),
                 footprint: c.find_str("footprint").unwrap_or("").to_string(),
+                fields,
             });
         }
     }
@@ -100,6 +130,10 @@ pub struct BoardFp {
     pub value: String,
     pub footprint: String,
     pub pads: Vec<BoardPad>,
+    /// Every `(property "Key" "Value")` on the footprint, in file order
+    /// (includes `Reference`/`Value`). Used to diff symbol fields against the
+    /// footprint's current properties.
+    pub props: Vec<(String, String)>,
 }
 
 /// Modeled `.kicad_pcb`: footprints plus the top-level net table.
@@ -147,16 +181,18 @@ pub fn parse_board(content: &str) -> anyhow::Result<BoardModel> {
         let footprint = fp.get(1).and_then(|n| n.as_str()).unwrap_or("").to_string();
         let mut reference = String::new();
         let mut value = String::new();
+        let mut props = Vec::new();
         for p in fp.find_all("property") {
-            match p.get(1).and_then(|n| n.as_str()) {
-                Some("Reference") => {
-                    reference = p.get(2).and_then(|n| n.as_str()).unwrap_or("").to_string()
-                }
-                Some("Value") => {
-                    value = p.get(2).and_then(|n| n.as_str()).unwrap_or("").to_string()
-                }
+            let Some(key) = p.get(1).and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let val = p.get(2).and_then(|n| n.as_str()).unwrap_or("");
+            match key {
+                "Reference" => reference = val.to_string(),
+                "Value" => value = val.to_string(),
                 _ => {}
             }
+            props.push((key.to_string(), val.to_string()));
         }
         if reference.is_empty() {
             continue;
@@ -177,6 +213,7 @@ pub fn parse_board(content: &str) -> anyhow::Result<BoardModel> {
             value,
             footprint,
             pads,
+            props,
         });
     }
 
@@ -206,6 +243,18 @@ pub struct ValueChange {
     pub new: String,
 }
 
+/// A footprint property (symbol field) that must be added or updated so the
+/// board matches the schematic. `old` is `None` when the footprint carries no
+/// such property yet (the "missing symbol field" case) and `Some(_)` when it
+/// exists but holds a stale value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldChange {
+    pub reference: String,
+    pub field: String,
+    pub old: Option<String>,
+    pub new: String,
+}
+
 /// The full board-vs-schematic diff: actionable changes plus warnings for
 /// everything the file-only path deliberately does not touch.
 #[derive(Debug, Clone, Default)]
@@ -214,6 +263,9 @@ pub struct Plan {
     pub pad_net_changes: Vec<PadNetChange>,
     /// Component value updates to apply.
     pub value_changes: Vec<ValueChange>,
+    /// Footprint property (symbol field) additions/updates to apply — the
+    /// generic symbol-field → footprint-property sync.
+    pub field_changes: Vec<FieldChange>,
     /// Net names referenced by a change but missing from a coded board's net
     /// table (empty for name-only boards, which need no table). First-seen order.
     pub nets_to_add: Vec<String>,
@@ -234,7 +286,9 @@ pub struct Plan {
 impl Plan {
     /// Are there any changes to apply?
     pub fn is_empty(&self) -> bool {
-        self.pad_net_changes.is_empty() && self.value_changes.is_empty()
+        self.pad_net_changes.is_empty()
+            && self.value_changes.is_empty()
+            && self.field_changes.is_empty()
     }
 }
 
@@ -270,6 +324,29 @@ pub fn plan(nl: &Netlist, board: &BoardModel) -> Plan {
                 fp.footprint.clone(),
                 comp.footprint.clone(),
             ));
+        }
+
+        // Generic symbol-field → footprint-property sync (KiCad F8 treats the
+        // schematic symbol as authoritative for fields like MANUFACTURER_NAME,
+        // HEIGHT, Digi-Key_Part_Number). Skip the structural fields handled
+        // elsewhere — Reference (identity), Value (its own change list), and
+        // Footprint (refootprinting needs geometry, reported as a warning) — and
+        // skip "~" (KiCad's no-datasheet sentinel), which parses as a value but
+        // means "empty", so we never blank a footprint field.
+        for (name, new_val) in &comp.fields {
+            if matches!(name.as_str(), "Reference" | "Value" | "Footprint") || new_val.as_str() == "~"
+            {
+                continue;
+            }
+            match fp.props.iter().find(|(k, _)| k == name).map(|(_, v)| v) {
+                Some(cur) if cur == new_val => {}
+                cur => out.field_changes.push(FieldChange {
+                    reference: fp.reference.clone(),
+                    field: name.clone(),
+                    old: cur.cloned(),
+                    new: new_val.clone(),
+                }),
+            }
         }
 
         for pad in &fp.pads {
@@ -475,5 +552,130 @@ mod tests {
         let p = plan(&nl, &b);
         assert_eq!(p.pad_net_changes.len(), 1);
         assert_eq!(p.nets_to_add, vec!["NEWNET"]);
+    }
+
+    // ─── Symbol-field → footprint-property sync ────────────────────────────
+
+    // U1 carries custom symbol fields; the "Footprint"/"Value" fields mirror
+    // the structural ids, and a value-less Datasheet field is present.
+    const FIELDS_NETLIST: &str = r#"(export (version "E")
+      (components
+        (comp (ref "U1") (value "MAX98357A") (footprint "Package:QFN")
+          (fields
+            (field (name "MANUFACTURER_NAME") "Analog Devices")
+            (field (name "HEIGHT") "0.80mm")
+            (field (name "Digi-Key_Part_Number") "MAX98357-ND")
+            (field (name "Datasheet"))
+            (field (name "Footprint") "Package:QFN")
+            (field (name "Value") "MAX98357A"))))
+      (nets))"#;
+
+    // Board where U1 already has HEIGHT (stale) but is missing every other field.
+    const FIELDS_BOARD: &str = r#"(kicad_pcb
+      (footprint "Package:QFN"
+        (property "Reference" "U1")
+        (property "Value" "MAX98357A")
+        (property "HEIGHT" "9.99mm")
+        (pad "1" smd roundrect (at 0 0) (net "GND"))))"#;
+
+    #[test]
+    fn parse_netlist_keeps_valued_fields_in_order_drops_empty() {
+        let nl = parse_netlist(FIELDS_NETLIST).unwrap();
+        let u1 = nl.comps.iter().find(|c| c.reference == "U1").unwrap();
+        // First-seen order preserved; the value-less Datasheet field is dropped.
+        // parse stays faithful — it keeps Footprint/Value here; plan filters them.
+        assert_eq!(
+            u1.fields,
+            vec![
+                (
+                    "MANUFACTURER_NAME".to_string(),
+                    "Analog Devices".to_string()
+                ),
+                ("HEIGHT".to_string(), "0.80mm".to_string()),
+                (
+                    "Digi-Key_Part_Number".to_string(),
+                    "MAX98357-ND".to_string()
+                ),
+                ("Footprint".to_string(), "Package:QFN".to_string()),
+                ("Value".to_string(), "MAX98357A".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_board_collects_all_properties() {
+        let b = parse_board(FIELDS_BOARD).unwrap();
+        let u1 = b.fps.iter().find(|f| f.reference == "U1").unwrap();
+        assert_eq!(
+            u1.props
+                .iter()
+                .find(|(k, _)| k == "HEIGHT")
+                .map(|(_, v)| v.as_str()),
+            Some("9.99mm")
+        );
+        // Reference/Value are collected into props too (not just their own fields).
+        assert!(u1.props.iter().any(|(k, _)| k == "Reference"));
+        assert!(u1.props.iter().any(|(k, _)| k == "Value"));
+    }
+
+    #[test]
+    fn plan_adds_missing_and_updates_stale_fields() {
+        let nl = parse_netlist(FIELDS_NETLIST).unwrap();
+        let b = parse_board(FIELDS_BOARD).unwrap();
+        let p = plan(&nl, &b);
+
+        // Structural fields never enter the generic field sync.
+        assert!(p
+            .field_changes
+            .iter()
+            .all(|c| c.field != "Value" && c.field != "Footprint" && c.field != "Reference"));
+
+        // HEIGHT exists but is stale → update.
+        let height = p.field_changes.iter().find(|c| c.field == "HEIGHT").unwrap();
+        assert_eq!(height.old.as_deref(), Some("9.99mm"));
+        assert_eq!(height.new, "0.80mm");
+
+        // MANUFACTURER_NAME and Digi-Key_Part_Number are missing → add.
+        let mfr = p
+            .field_changes
+            .iter()
+            .find(|c| c.field == "MANUFACTURER_NAME")
+            .unwrap();
+        assert_eq!(mfr.old, None);
+        assert_eq!(mfr.new, "Analog Devices");
+        assert!(p
+            .field_changes
+            .iter()
+            .any(|c| c.field == "Digi-Key_Part_Number" && c.old.is_none()));
+
+        // Exactly those three; Datasheet(empty)/Footprint/Value excluded.
+        assert_eq!(p.field_changes.len(), 3);
+        assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn plan_skips_tilde_datasheet_and_matching_fields() {
+        let nl = parse_netlist(
+            r#"(export (components (comp (ref "R1") (value "10k") (footprint "F")
+                 (fields
+                   (field (name "MANUFACTURER_NAME") "Yageo")
+                   (field (name "Datasheet") "~"))))
+               (nets))"#,
+        )
+        .unwrap();
+        // Board already carries MANUFACTURER_NAME=Yageo; Datasheet="~" must be
+        // treated as empty and never added.
+        let b = parse_board(
+            r#"(kicad_pcb (footprint "F"
+                 (property "Reference" "R1") (property "Value" "10k")
+                 (property "MANUFACTURER_NAME" "Yageo")
+                 (pad "1" smd (at 0 0) (net "N"))))"#,
+        )
+        .unwrap();
+        let p = plan(&nl, &b);
+        assert!(
+            p.field_changes.is_empty(),
+            "matching field + ~ datasheet ⇒ no field changes"
+        );
     }
 }

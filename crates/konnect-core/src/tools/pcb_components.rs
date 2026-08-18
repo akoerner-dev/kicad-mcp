@@ -9,7 +9,7 @@ use crate::tool;
 use crate::tools::netlist::{parse_board, parse_netlist, Plan};
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::client::KiCadIpcClient;
-use konnect_sexp::writer::{apply_edits, find_balanced_block, write_atomic, SexpEdit};
+use konnect_sexp::writer::{apply_edits, find_balanced_block, new_uuid, write_atomic, SexpEdit};
 use serde_json::json;
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
@@ -191,7 +191,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "update_pcb_from_schematic",
-            "File-based 'Update PCB from Schematic' (KiCAD's F8) for connectivity: exports the schematic's netlist with kicad-cli, then rewrites every board pad's (net ...) and each footprint's Value to match the schematic — the authoritative source — directly in the .kicad_pcb (S-expression edits, no KiCAD IPC). This closes board-vs-schematic net parity in one pass (a bulk set_pad_net). It does NOT add, delete, or refootprint components (that needs library geometry / IPC) or move copper — such cases are reported as warnings, not applied. Defaults to dry_run=true: returns the full diff without touching the file. Set dry_run=false to apply. After applying, re-run DRC; if KiCAD has the board open, revert/reload it.",
+            "File-based 'Update PCB from Schematic' (KiCAD's F8) for connectivity and metadata: exports the schematic's netlist with kicad-cli, then rewrites every board pad's (net ...), each footprint's Value, and each footprint's symbol fields (e.g. MANUFACTURER_NAME, HEIGHT, Digi-Key_Part_Number — adding fields the footprint is missing, updating stale ones) to match the schematic — the authoritative source — directly in the .kicad_pcb (S-expression edits, no KiCAD IPC). This closes board-vs-schematic net and field parity in one pass. It does NOT add, delete, or refootprint components (that needs library geometry / IPC) or move copper — such cases are reported as warnings, not applied. Defaults to dry_run=true: returns the full diff without touching the file. Set dry_run=false to apply. After applying, re-run DRC; if KiCAD has the board open, revert/reload it.",
             json!({
                 "type": "object",
                 "properties": {
@@ -793,6 +793,9 @@ fn plan_report(plan: &Plan) -> serde_json::Value {
         "value_changes": plan.value_changes.iter().map(|c| json!({
             "reference": c.reference, "from": c.old, "to": c.new
         })).collect::<Vec<_>>(),
+        "field_changes": plan.field_changes.iter().map(|c| json!({
+            "reference": c.reference, "field": c.field, "from": c.old, "to": c.new
+        })).collect::<Vec<_>>(),
         "nets_to_add": plan.nets_to_add,
         "warnings": {
             "missing_on_board": plan.missing_on_board,
@@ -818,6 +821,73 @@ fn locate_fp_block(content: &str, reference: &str) -> Option<(usize, usize)> {
 
 fn escape_sexp_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Byte offset of the next unescaped `"` in `s`, skipping `\"` escapes. Used to
+/// find the end of a property's quoted value even when the value itself
+/// contains an escaped quote.
+fn find_unescaped_quote(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Build an edit replacing the quoted value of `(property "<key>" "<old>" ...)`
+/// within the footprint block `[fp_start, fp_end)`. Returns a reason string on
+/// failure so the caller can record a skip.
+fn replace_property_value_edit(
+    content: &str,
+    fp_start: usize,
+    fp_end: usize,
+    key: &str,
+    new_val: &str,
+) -> Result<SexpEdit, String> {
+    let pat = format!("(property \"{key}\" \"");
+    let rel = content[fp_start..fp_end]
+        .find(&pat)
+        .ok_or_else(|| format!("{key} property not found"))?;
+    let val_open = fp_start + rel + pat.len();
+    let close_rel = find_unescaped_quote(&content[val_open..fp_end])
+        .ok_or_else(|| format!("unterminated {key} string"))?;
+    let val_close = val_open + close_rel;
+    Ok(SexpEdit::replace(
+        val_open,
+        val_close,
+        escape_sexp_str(new_val),
+    ))
+}
+
+/// Byte offset just past the last `(property ...)` block within the footprint
+/// `[fp_start, fp_end)` — the anchor for appending new property nodes so they
+/// stay grouped with the existing ones. Falls back to just before the
+/// footprint's closing paren (every real footprint carries a Reference
+/// property, so the fallback is defensive only).
+fn last_property_end(content: &str, fp_start: usize, fp_end: usize) -> usize {
+    match content[fp_start..fp_end].rfind("(property \"") {
+        Some(rel) => find_balanced_block(content, fp_start + rel)
+            .map(|(_, e)| e)
+            .unwrap_or(fp_end - 1),
+        None => fp_end - 1,
+    }
+}
+
+/// Render a footprint property block in KiCAD's on-disk format for a hidden
+/// fab-layer data field, ready to splice into a footprint. Leads with a newline
+/// + two tabs so it appends cleanly after a sibling property block.
+fn footprint_property_sexp(key: &str, value: &str) -> String {
+    format!(
+        "\n\t\t(property \"{}\" \"{}\"\n\t\t\t(at 0 0 0)\n\t\t\t(unlocked yes)\n\t\t\t(layer \"F.Fab\")\n\t\t\t(hide yes)\n\t\t\t(uuid \"{}\")\n\t\t\t(effects\n\t\t\t\t(font\n\t\t\t\t\t(size 1 1)\n\t\t\t\t\t(thickness 0.15)\n\t\t\t\t)\n\t\t\t)\n\t\t)",
+        escape_sexp_str(key),
+        escape_sexp_str(value),
+        new_uuid()
+    )
 }
 
 async fn handle_update_pcb_from_schematic(
@@ -869,6 +939,7 @@ async fn handle_update_pcb_from_schematic(
             "would_change": {
                 "pad_nets": plan.pad_net_changes.len(),
                 "values": plan.value_changes.len(),
+                "fields": plan.field_changes.len(),
                 "nets_added": plan.nets_to_add.len(),
             },
             "plan": report,
@@ -880,9 +951,9 @@ async fn handle_update_pcb_from_schematic(
         return Ok(CallToolResult::json(&json!({
             "board": board_path.display().to_string(),
             "dry_run": false,
-            "applied": { "pad_nets": 0, "values": 0, "nets_added": 0 },
+            "applied": { "pad_nets": 0, "values": 0, "fields": 0, "nets_added": 0 },
             "plan": report,
-            "note": "Board already matches the schematic for pad nets and values. No changes written."
+            "note": "Board already matches the schematic for pad nets, values, and fields. No changes written."
         })));
     }
 
@@ -980,23 +1051,58 @@ async fn handle_update_pcb_from_schematic(
             skipped.push(json!({ "reference": ch.reference, "field": "Value", "reason": "footprint block not found" }));
             continue;
         };
-        let val_pat = "(property \"Value\" \"";
-        let Some(rel) = content[fp_start..fp_end].find(val_pat) else {
-            skipped.push(json!({ "reference": ch.reference, "field": "Value", "reason": "Value property not found" }));
+        match replace_property_value_edit(&content, fp_start, fp_end, "Value", &ch.new) {
+            Ok(edit) => edits.push(edit),
+            Err(reason) => {
+                skipped.push(json!({ "reference": ch.reference, "field": "Value", "reason": reason }))
+            }
+        }
+    }
+
+    // 6. Symbol-field → footprint-property sync. Each (reference, field) pair is
+    //    handled once even if it appears twice — which only happens when a board
+    //    carries the same refdes on two footprints; like the pad/value sync
+    //    above, the edit then targets the first match. Deduplicating first also
+    //    avoids splicing a field twice into one footprint or emitting two
+    //    overlapping value replaces. Stale values are replaced in place; missing
+    //    fields are grouped per footprint into a single splice after the last
+    //    existing property, preserving KiCAD-native formatting and field order.
+    let mut applied_fields = 0usize;
+    let mut seen_fields: std::collections::HashSet<(&str, &str)> =
+        std::collections::HashSet::new();
+    let mut adds_by_ref: std::collections::BTreeMap<String, (usize, String)> =
+        std::collections::BTreeMap::new();
+    for ch in &plan.field_changes {
+        if !seen_fields.insert((ch.reference.as_str(), ch.field.as_str())) {
+            continue;
+        }
+        let Some((fp_start, fp_end)) = locate_fp_block(&content, &ch.reference) else {
+            skipped.push(json!({ "reference": ch.reference, "property": ch.field, "reason": "footprint block not found" }));
             continue;
         };
-        let val_open = fp_start + rel + val_pat.len();
-        // Old value runs to the next unescaped quote.
-        let Some(close_rel) = content[val_open..fp_end].find('"') else {
-            skipped.push(json!({ "reference": ch.reference, "field": "Value", "reason": "unterminated Value string" }));
-            continue;
-        };
-        let val_close = val_open + close_rel;
-        edits.push(SexpEdit::replace(
-            val_open,
-            val_close,
-            escape_sexp_str(&ch.new),
-        ));
+        match &ch.old {
+            Some(_) => {
+                match replace_property_value_edit(&content, fp_start, fp_end, &ch.field, &ch.new) {
+                    Ok(edit) => {
+                        edits.push(edit);
+                        applied_fields += 1;
+                    }
+                    Err(reason) => skipped.push(
+                        json!({ "reference": ch.reference, "property": ch.field, "reason": reason }),
+                    ),
+                }
+            }
+            None => {
+                let entry = adds_by_ref.entry(ch.reference.clone()).or_insert_with(|| {
+                    (last_property_end(&content, fp_start, fp_end), String::new())
+                });
+                entry.1.push_str(&footprint_property_sexp(&ch.field, &ch.new));
+                applied_fields += 1;
+            }
+        }
+    }
+    for (anchor, text) in adds_by_ref.into_values() {
+        edits.push(SexpEdit::insert(anchor, text));
     }
 
     let applied_pad_nets =
@@ -1013,6 +1119,7 @@ async fn handle_update_pcb_from_schematic(
         "applied": {
             "pad_nets": applied_pad_nets,
             "values": applied_values,
+            "fields": applied_fields,
             "nets_added": plan.nets_to_add.len(),
         },
         "skipped": skipped,
@@ -1315,6 +1422,142 @@ mod update_from_schematic_tests {
         assert!(!updated.contains("(net 1 "), "must stay name-only");
     }
 
+    /// Symbol-field sync end-to-end: a missing MANUFACTURER_NAME is spliced in
+    /// and a stale HEIGHT is rewritten in place; the result re-parses and a
+    /// second pass is idempotent.
+    #[tokio::test]
+    async fn apply_adds_and_updates_symbol_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        let netlist = dir.path().join("b.net");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\t(footprint \"QFN\" (layer \"F.Cu\")\n\
+             \t\t(property \"Reference\" \"U1\" (at 0 0))\n\
+             \t\t(property \"Value\" \"IC\" (at 0 0))\n\
+             \t\t(property \"HEIGHT\" \"9.99mm\" (at 0 0) (layer \"F.Fab\") (hide yes))\n\
+             \t\t(pad \"1\" smd roundrect (at 0 0) (net \"GND\")))\n)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &netlist,
+            r#"(export (components
+                 (comp (ref "U1") (value "IC") (footprint "QFN")
+                   (fields
+                     (field (name "MANUFACTURER_NAME") "Analog Devices")
+                     (field (name "HEIGHT") "0.80mm"))))
+               (nets))"#,
+        )
+        .unwrap();
+        let ctx = test_ctx();
+
+        // Dry run: 1 add + 1 update = 2 field changes, nothing written.
+        let dry = body(
+            &handle_update_pcb_from_schematic(
+                &json!({ "board": board.to_str().unwrap(), "netlist": netlist.to_str().unwrap() }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dry["would_change"]["fields"], json!(2));
+
+        // Apply.
+        let applied = body(
+            &handle_update_pcb_from_schematic(
+                &json!({ "board": board.to_str().unwrap(), "netlist": netlist.to_str().unwrap(), "dry_run": false }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(applied["applied"]["fields"], json!(2));
+
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert!(
+            updated.contains("(property \"MANUFACTURER_NAME\" \"Analog Devices\""),
+            "MANUFACTURER_NAME should be spliced in"
+        );
+        assert!(
+            updated.contains("\"HEIGHT\" \"0.80mm\""),
+            "HEIGHT should be updated in place"
+        );
+        assert!(!updated.contains("9.99mm"), "stale HEIGHT value must be gone");
+
+        // The rewritten board must still parse, and the new property round-trips.
+        let reparsed = crate::tools::netlist::parse_board(&updated).unwrap();
+        let u1 = reparsed.fps.iter().find(|f| f.reference == "U1").unwrap();
+        assert_eq!(
+            u1.props
+                .iter()
+                .find(|(k, _)| k == "MANUFACTURER_NAME")
+                .map(|(_, v)| v.as_str()),
+            Some("Analog Devices")
+        );
+
+        // Idempotent: a second dry run finds no more field changes.
+        let second = body(
+            &handle_update_pcb_from_schematic(
+                &json!({ "board": board.to_str().unwrap(), "netlist": netlist.to_str().unwrap() }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(second["would_change"]["fields"], json!(0));
+    }
+
+    /// A board that (defectively) carries the same refdes on two footprints must
+    /// not get the same field spliced twice: the (reference, field) pair is
+    /// applied exactly once, to the first match.
+    #[tokio::test]
+    async fn apply_dedupes_field_add_for_duplicate_refdes() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("b.kicad_pcb");
+        let netlist = dir.path().join("b.net");
+        std::fs::write(
+            &board,
+            "(kicad_pcb\n\
+             \t(footprint \"F\" (layer \"F.Cu\")\n\
+             \t\t(property \"Reference\" \"U1\" (at 0 0))\n\
+             \t\t(property \"Value\" \"IC\" (at 0 0))\n\
+             \t\t(pad \"1\" smd (at 0 0) (net \"N\")))\n\
+             \t(footprint \"F\" (layer \"F.Cu\")\n\
+             \t\t(property \"Reference\" \"U1\" (at 0 0))\n\
+             \t\t(property \"Value\" \"IC\" (at 0 0))\n\
+             \t\t(pad \"1\" smd (at 0 0) (net \"N\")))\n)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &netlist,
+            r#"(export (components
+                 (comp (ref "U1") (value "IC") (footprint "F")
+                   (fields (field (name "MPN") "XYZ")))) (nets))"#,
+        )
+        .unwrap();
+        let ctx = test_ctx();
+
+        let applied = body(
+            &handle_update_pcb_from_schematic(
+                &json!({ "board": board.to_str().unwrap(), "netlist": netlist.to_str().unwrap(), "dry_run": false }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            applied["applied"]["fields"],
+            json!(1),
+            "duplicate refdes ⇒ exactly one field add"
+        );
+        let updated = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(
+            updated.matches("(property \"MPN\" \"XYZ\"").count(),
+            1,
+            "MPN must be spliced exactly once, into the first U1"
+        );
+    }
+
     /// Diagnostic: print the dry-run diff for a real board + netlist without
     /// writing anything. Skipped unless TEST_PCB and TEST_NETLIST are set.
     #[tokio::test]
@@ -1378,6 +1621,11 @@ mod update_from_schematic_tests {
             "after applying, a dry run must find no more pad-net changes"
         );
         assert_eq!(second["would_change"]["values"], json!(0));
+        assert_eq!(
+            second["would_change"]["fields"],
+            json!(0),
+            "after applying, a dry run must find no more field changes"
+        );
     }
 }
 
