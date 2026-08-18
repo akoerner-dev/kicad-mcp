@@ -293,7 +293,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "assign_net_to_class",
-            "Assign a net to an existing netclass in the PCB file (S-expression edit).",
+            "Assign a net to an existing netclass. On a modern KiCad 7+ board this records the membership \
+             in the sibling .kicad_pro's net_settings — as a netclass_patterns entry, or in the \
+             netclass_assignments map if the board already uses that structure; on a legacy board it edits \
+             the (net_class …) block in the .kicad_pcb. Re-assigning an already-classed net moves it \
+             rather than double-assigning. The class must already exist — create it first with create_netclass.",
             json!({
                 "type": "object",
                 "properties": {
@@ -857,6 +861,147 @@ fn upsert_project_netclass(
     Ok((updated, final_class))
 }
 
+/// Result of assigning a net to a class in the modern project file.
+#[derive(Debug, PartialEq)]
+enum NetAssign {
+    /// A new membership entry was written.
+    Added,
+    /// This net's membership was moved from another class.
+    Reassigned { from: String },
+    /// The net was already assigned to this exact class (nothing written).
+    AlreadyAssigned,
+}
+
+/// Assign `net_name` to `netclass` in the modern KiCad 7+ project file.
+///
+/// KiCad 10 keeps net-to-class membership in one of two co-equal structures
+/// under `net_settings`:
+/// * `netclass_patterns[]` — pattern → class entries with exactly two keys,
+///   `{"netclass":"Power","pattern":"GND"}` (verified against all 122 such
+///   entries in KiCad's own demo projects). A literal net name is a pattern
+///   that matches exactly that net.
+/// * `netclass_assignments{}` — an exact `net-name -> [class]` map (verified
+///   against shipped demos, e.g. jetson-agx-thor-baseboard with 391 entries).
+///
+/// Shipped demos populate exactly ONE of the two, never both. To avoid ever
+/// leaving two disagreeing memberships, this writes to whichever structure the
+/// board already uses — the assignments map when it is non-empty, otherwise
+/// patterns — and defaults to `netclass_patterns` (what current KiCad writes
+/// for a fresh assignment) when the board uses neither yet (the ClearBell case).
+///
+/// In both structures a net's membership is a single entry, so assigning an
+/// already-classed net to a different class MOVES it (rewrites that one entry)
+/// rather than creating a conflicting second membership. Wildcard patterns that
+/// merely also match the net are left untouched — only the exact-match entry is
+/// this net's own.
+///
+/// Returns `Ok(None)` if `netclass` is not among `net_settings.classes[]` — the
+/// caller turns that into a not-found error, mirroring the legacy path, since
+/// assigning to a class KiCad doesn't know is meaningless.
+fn assign_net_in_project(
+    project_path: &std::path::Path,
+    netclass: &str,
+    net_name: &str,
+) -> anyhow::Result<Option<NetAssign>> {
+    let content = std::fs::read_to_string(project_path)?;
+    let mut root: serde_json::Value = serde_json::from_str(&content)?;
+
+    // The class must already exist in the project; mirror the legacy guard.
+    let class_exists = root
+        .pointer("/net_settings/classes")
+        .and_then(|v| v.as_array())
+        .is_some_and(|classes| {
+            classes
+                .iter()
+                .any(|c| c.get("name").and_then(|n| n.as_str()) == Some(netclass))
+        });
+    if !class_exists {
+        return Ok(None);
+    }
+
+    // Does this board keep membership in the exact-map structure? (Checked
+    // before the mutable borrow below; root is not mutated in between.)
+    let uses_assignments = root
+        .pointer("/net_settings/netclass_assignments")
+        .and_then(|v| v.as_object())
+        .is_some_and(|m| !m.is_empty());
+
+    let net_settings = root
+        .get_mut("net_settings")
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "project file has no net_settings object: {}",
+                project_path.display()
+            )
+        })?;
+
+    let outcome = if uses_assignments {
+        // net_settings.netclass_assignments: { "net": ["class"] }
+        let map = net_settings
+            .get_mut("netclass_assignments")
+            .and_then(|v| v.as_object_mut())
+            .expect("uses_assignments guarantees a non-empty object");
+        // Owned copy of the current class so no borrow is held across insert.
+        let current = map
+            .get(net_name)
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+        match current {
+            Some(ref cur) if cur == netclass => {
+                return Ok(Some(NetAssign::AlreadyAssigned)); // no write
+            }
+            Some(from) => {
+                map.insert(net_name.to_string(), json!([netclass]));
+                NetAssign::Reassigned { from }
+            }
+            None => {
+                map.insert(net_name.to_string(), json!([netclass]));
+                NetAssign::Added
+            }
+        }
+    } else {
+        // net_settings.netclass_patterns: [ { "netclass": .., "pattern": .. } ]
+        // Older project files may omit the array entirely; treat that as empty.
+        let patterns = net_settings
+            .entry("netclass_patterns")
+            .or_insert_with(|| json!([]));
+        if !patterns.is_array() {
+            *patterns = json!([]);
+        }
+        let patterns = patterns.as_array_mut().unwrap();
+
+        if let Some(entry) = patterns
+            .iter_mut()
+            .find(|p| p.get("pattern").and_then(|v| v.as_str()) == Some(net_name))
+        {
+            let current = entry
+                .get("netclass")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if current == netclass {
+                return Ok(Some(NetAssign::AlreadyAssigned)); // no write
+            }
+            entry["netclass"] = json!(netclass);
+            NetAssign::Reassigned { from: current }
+        } else {
+            patterns.push(json!({ "netclass": netclass, "pattern": net_name }));
+            NetAssign::Added
+        }
+    };
+
+    // Trailing newline + preserved key order, exactly like
+    // upsert_project_netclass — keeps the diff minimal on a versioned file.
+    write_atomic(
+        project_path,
+        &format!("{}\n", serde_json::to_string_pretty(&root)?),
+    )?;
+    Ok(Some(outcome))
+}
+
 async fn handle_create_netclass(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -941,6 +1086,52 @@ async fn handle_assign_net_to_class(
 
     let content = std::fs::read_to_string(&board_path)?;
 
+    // Real legacy token is `(net_class ` (unwrapped) — see create_netclass and
+    // the sibling_project_path doc comment. A modern KiCad 7+ board has no such
+    // block; net-to-class membership lives in the .kicad_pro's
+    // net_settings.netclass_patterns[]. Prefer the project file unless the board
+    // is actively using the legacy block — same policy as create_netclass. This
+    // is the fix for the Sitzung-F finding that assign_net_to_class was skipped
+    // by the .kicad_pro migration and was therefore inert on all ClearBell
+    // (KiCad 10) boards.
+    let has_legacy_block = content.contains("(net_class ");
+    if !has_legacy_block {
+        if let Some(project_path) = sibling_project_path(&board_path) {
+            if project_has_netclasses(&project_path) {
+                return Ok(
+                    match assign_net_in_project(&project_path, &netclass, &net_name)? {
+                        Some(NetAssign::Added) => CallToolResult::json(&json!({
+                            "assigned": true,
+                            "already_assigned": false,
+                            "net_name": net_name,
+                            "netclass": netclass,
+                            "target": "project .kicad_pro net_settings"
+                        })),
+                        Some(NetAssign::Reassigned { from }) => CallToolResult::json(&json!({
+                            "assigned": true,
+                            "already_assigned": false,
+                            "reassigned_from": from,
+                            "net_name": net_name,
+                            "netclass": netclass,
+                            "target": "project .kicad_pro net_settings"
+                        })),
+                        Some(NetAssign::AlreadyAssigned) => CallToolResult::json(&json!({
+                            "assigned": false,
+                            "already_assigned": true,
+                            "net_name": net_name,
+                            "netclass": netclass,
+                            "target": "project .kicad_pro net_settings"
+                        })),
+                        None => CallToolResult::error(format!(
+                            "Netclass '{netclass}' not found in project net_settings.classes"
+                        )),
+                    },
+                );
+            }
+        }
+    }
+
+    // ─── Legacy path: (netclass "NAME" ...) block in the .kicad_pcb ───
     // Find the netclass block: (netclass "NAME" ...)
     let nc_pat = format!("(netclass \"{}\"", netclass);
     let nc_pos = match content.find(&nc_pat) {
@@ -1687,6 +1878,213 @@ mod netclass_json_tests {
         assert_eq!(body["clearance"], 0.15);
         assert_eq!(body["via_drill"], 0.3);
         assert_eq!(body["via_diameter"], 0.6);
+    }
+
+    // ─── assign_net_to_class: modern .kicad_pro fallback (Tier B #2) ───
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            crate::tools::ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            std::sync::Arc::new(crate::router::ToolRouter::new()),
+        )
+    }
+
+    /// assign_net_in_project appends the exact KiCad pattern entry shape
+    /// {"netclass":…,"pattern":…} and is idempotent on a repeat call.
+    #[test]
+    fn assign_net_in_project_appends_pattern_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_sample(dir.path()); // class "Default", netclass_patterns: []
+
+        let first = assign_net_in_project(&path, "Default", "GND").unwrap();
+        assert_eq!(first, Some(NetAssign::Added), "first assignment writes a new pattern");
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let pats = saved["net_settings"]["netclass_patterns"].as_array().unwrap();
+        assert_eq!(pats.len(), 1);
+        assert_eq!(pats[0]["netclass"], "Default");
+        assert_eq!(pats[0]["pattern"], "GND");
+
+        // Second identical call must not duplicate the entry — and must not
+        // write at all (the AlreadyAssigned arm returns before write_atomic).
+        let before = std::fs::read_to_string(&path).unwrap();
+        let second = assign_net_in_project(&path, "Default", "GND").unwrap();
+        assert_eq!(
+            second,
+            Some(NetAssign::AlreadyAssigned),
+            "already present -> nothing written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "idempotent: file byte-for-byte unchanged on a no-op assign"
+        );
+    }
+
+    /// Re-assigning an exact net to a different class MOVES it: the single
+    /// exact-match pattern is rewritten, not duplicated, so the net never ends
+    /// up with two conflicting memberships.
+    #[test]
+    fn assign_net_in_project_reassigns_exact_net_between_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pro");
+        std::fs::write(
+            &path,
+            r#"{"net_settings":{"classes":[{"name":"Default"},{"name":"Power"}],"netclass_patterns":[]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            assign_net_in_project(&path, "Default", "GND").unwrap(),
+            Some(NetAssign::Added)
+        );
+        assert_eq!(
+            assign_net_in_project(&path, "Power", "GND").unwrap(),
+            Some(NetAssign::Reassigned { from: "Default".to_string() }),
+            "same net, new class -> moved"
+        );
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let pats = saved["net_settings"]["netclass_patterns"].as_array().unwrap();
+        assert_eq!(pats.len(), 1, "net moves, it is not double-assigned");
+        assert_eq!(pats[0]["netclass"], "Power");
+        assert_eq!(pats[0]["pattern"], "GND");
+    }
+
+    /// jetson-style board: membership lives in net_settings.netclass_assignments
+    /// (exact net -> [class] map) with patterns empty. The tool must write to
+    /// that same map — never append a conflicting pattern beside it — and stay
+    /// idempotent / move correctly there too.
+    #[test]
+    fn assign_net_uses_assignments_map_when_board_uses_that_structure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.kicad_pro");
+        std::fs::write(
+            &path,
+            r#"{"net_settings":{"classes":[{"name":"Default"},{"name":"HS"}],"netclass_assignments":{"/USB/D+":["HS"]},"netclass_patterns":[]}}"#,
+        )
+        .unwrap();
+
+        // Re-assign an existing map entry to another class -> rewrites the map.
+        assert_eq!(
+            assign_net_in_project(&path, "Default", "/USB/D+").unwrap(),
+            Some(NetAssign::Reassigned { from: "HS".to_string() })
+        );
+        // A brand-new net on this board also lands in the map (stay consistent
+        // with the structure the board already uses), NOT in patterns.
+        assert_eq!(
+            assign_net_in_project(&path, "HS", "GND").unwrap(),
+            Some(NetAssign::Added)
+        );
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let asg = saved["net_settings"]["netclass_assignments"]
+            .as_object()
+            .unwrap();
+        assert_eq!(asg["/USB/D+"], json!(["Default"]), "moved, not duplicated");
+        assert_eq!(asg["GND"], json!(["HS"]));
+        assert!(
+            saved["net_settings"]["netclass_patterns"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "must not split mechanisms by also writing a pattern"
+        );
+
+        // Idempotent on the map path as well.
+        assert_eq!(
+            assign_net_in_project(&path, "HS", "GND").unwrap(),
+            Some(NetAssign::AlreadyAssigned)
+        );
+    }
+
+    /// Assigning to a class absent from net_settings.classes[] returns None
+    /// (caller -> not-found error) and writes nothing — mirrors the legacy guard.
+    #[test]
+    fn assign_net_in_project_returns_none_for_unknown_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_sample(dir.path());
+        assert_eq!(
+            assign_net_in_project(&path, "NoSuchClass", "GND").unwrap(),
+            None
+        );
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved["net_settings"]["netclass_patterns"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// End-to-end through the async handler: a modern board (no legacy
+    /// (net_class …) block) routes the assignment into the sibling .kicad_pro and
+    /// leaves the .kicad_pcb byte-for-byte unchanged — the exact gap this fixes
+    /// (the tool was previously inert on KiCad 7+ boards).
+    #[tokio::test]
+    async fn handle_assign_routes_modern_board_into_project_and_leaves_pcb_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let pcb_before = "(kicad_pcb (setup))";
+        std::fs::write(&board, pcb_before).unwrap();
+        write_sample(dir.path());
+
+        let args = json!({
+            "board": board.to_str().unwrap(),
+            "net_name": "GND",
+            "netclass": "Default"
+        });
+        let result = handle_assign_net_to_class(&args, &ctx()).await.unwrap();
+        assert!(!result.is_error);
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => {
+                serde_json::from_str::<serde_json::Value>(text).unwrap()
+            }
+            _ => panic!("expected text content"),
+        };
+        assert_eq!(body["assigned"], true);
+        assert_eq!(body["already_assigned"], false);
+
+        // Modern board: the .kicad_pcb must be untouched (no legacy insert).
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), pcb_before);
+
+        // The assignment landed as a pattern in the project file.
+        let saved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("board.kicad_pro")).unwrap(),
+        )
+        .unwrap();
+        let pats = saved["net_settings"]["netclass_patterns"]
+            .as_array()
+            .unwrap();
+        assert_eq!(pats.len(), 1);
+        assert_eq!(pats[0]["pattern"], "GND");
+        assert_eq!(pats[0]["netclass"], "Default");
+    }
+
+    /// The handler returns an error when the class is absent from the project —
+    /// assigning to a class KiCad doesn't know is meaningless.
+    #[tokio::test]
+    async fn handle_assign_errors_when_class_missing_in_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (setup))").unwrap();
+        write_sample(dir.path());
+
+        let args = json!({
+            "board": board.to_str().unwrap(),
+            "net_name": "GND",
+            "netclass": "DoesNotExist"
+        });
+        let result = handle_assign_net_to_class(&args, &ctx()).await.unwrap();
+        assert!(result.is_error, "unknown class must be an error");
     }
 }
 

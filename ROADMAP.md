@@ -44,8 +44,6 @@ currently promise more than their handlers deliver.
   board — so the handler now refuses with an error instead of writing. A real
   implementation must target the sibling `<project>.kicad_dru` file; per-board
   minimums already work via `set_design_rules`.
-- **`assign_net_to_class`** was missed by the `.kicad_pro` migration and still
-  reads/writes only the legacy `(net_class …)` block, so it is inert on KiCAD 7+ boards.
 - **`move_connected`** delegates to the plain move; connected wires do not stretch.
 - **`annotate_schematic`** rewrites `?` only in the instance path, not in the
   visible `(property "Reference" …)`, so other tools still find the part as `R?`.
@@ -104,6 +102,10 @@ currently promise more than their handlers deliver.
 - ~~Design rules on KiCAD 7+~~ — `set_design_rules`/`get_design_rules`/`create_netclass`
   fall back to the sibling `.kicad_pro` JSON when a board has no legacy
   `(net_class …)` block, preserving key order so one-field edits stay one-line diffs.
+  `assign_net_to_class` joins them: on a modern board it records membership in
+  the board's own `net_settings` structure — a `netclass_patterns[]` entry, or
+  the `netclass_assignments` map if the board already uses that — instead of the
+  dead legacy block, moving a net rather than double-assigning it.
 - ~~Teardrop control~~ — `set_pad_teardrop` suppresses regeneration at a pad and
   `delete_teardrop_zone` removes an existing teardrop zone (they have no `uuid`, so
   `delete_trace` cannot target them).

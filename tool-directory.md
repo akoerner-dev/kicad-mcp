@@ -239,7 +239,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_unrouted_connections` | List missing copper connections (ratsnest) per net, resolved to exact (reference, pad) pairs by position — not locale-dependent text parsing. |
 | `modify_trace` | Modify a trace segment by deleting and re-adding it with new parameters. |
 | `create_netclass` | Add a netclass definition to the board's design rules (S-expression insert). |
-| `assign_net_to_class` | Assign a net to an existing netclass in the PCB file (S-expression edit). |
+| `assign_net_to_class` | Assign a net to an existing netclass. Modern KiCad 7+ boards: records membership in the project's `.kicad_pro` `net_settings` (a `netclass_patterns` entry, or the `netclass_assignments` map if the board uses that); legacy boards: edits the `(net_class …)` block. Class must exist first. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
 
 ### `pcb_export` · 13 tools
