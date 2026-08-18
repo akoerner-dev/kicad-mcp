@@ -334,6 +334,87 @@ mod arg_helper_tests {
         let v = require_str(&args, "name").expect("should parse");
         assert_eq!(v, "ok");
     }
+
+    #[test]
+    fn expand_kicad_env_vars_process_env_and_passthrough() {
+        // Unknown var is left verbatim; unterminated is left verbatim.
+        assert_eq!(expand_kicad_env_vars("${NOPE_XYZ}/a"), "${NOPE_XYZ}/a");
+        assert_eq!(expand_kicad_env_vars("${KICAD"), "${KICAD");
+        assert_eq!(expand_kicad_env_vars("plain/path"), "plain/path");
+        // Process environment wins for any var name.
+        std::env::set_var("KONNECT_EXPAND_TEST_DIR", "/opt/fp");
+        assert_eq!(
+            expand_kicad_env_vars("${KONNECT_EXPAND_TEST_DIR}/Lib.pretty"),
+            "/opt/fp/Lib.pretty"
+        );
+        // Multiple references in one URI.
+        std::env::set_var("KONNECT_EXPAND_TEST_A", "x");
+        std::env::set_var("KONNECT_EXPAND_TEST_B", "y");
+        assert_eq!(
+            expand_kicad_env_vars("${KONNECT_EXPAND_TEST_A}/${KONNECT_EXPAND_TEST_B}"),
+            "x/y"
+        );
+    }
+
+    #[test]
+    fn resolve_nick_follows_nested_table_and_env_vars() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A .pretty dir containing one footprint.
+        let pretty = tmp.path().join("MyLib.pretty");
+        std::fs::create_dir_all(&pretty).unwrap();
+        std::fs::write(pretty.join("R_test.kicad_mod"), "(footprint \"R_test\")").unwrap();
+
+        // Child table registers MyLib via an env-var URI (tab-indented, as KiCad writes).
+        std::env::set_var("KONNECT_NESTED_FP_DIR", tmp.path().to_str().unwrap());
+        let child = tmp.path().join("child-fp-lib-table");
+        std::fs::write(
+            &child,
+            "(fp_lib_table\n\t(lib (name \"MyLib\") (type \"KiCad\") \
+             (uri \"${KONNECT_NESTED_FP_DIR}/MyLib.pretty\") (options \"\") (descr \"\"))\n)",
+        )
+        .unwrap();
+
+        // Root table pulls the child in as a (type "Table") include.
+        let root = tmp.path().join("fp-lib-table");
+        std::fs::write(
+            &root,
+            format!(
+                "(fp_lib_table\n\t(lib (name \"Std\") (type \"Table\") (uri \"{}\") \
+                 (options \"\") (descr \"\"))\n)",
+                child.to_str().unwrap().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+
+        let mut visited = std::collections::HashSet::new();
+        let dir = resolve_nick_in_fp_table(&root, "MyLib", &mut visited)
+            .expect("nickname resolves through the nested table + env var");
+        assert_eq!(
+            dir.canonicalize().unwrap(),
+            pretty.canonicalize().unwrap(),
+            "resolved to the wrong .pretty dir"
+        );
+        // A cycle guard: a missing nickname just returns None, not a hang.
+        let mut v2 = std::collections::HashSet::new();
+        assert!(resolve_nick_in_fp_table(&root, "Absent", &mut v2).is_none());
+    }
+
+    #[test]
+    fn live_resolve_stock_footprint() {
+        // Only meaningful with both KiCad's standard libraries and a user
+        // fp-lib-table present (the nested standard table lives there). On a
+        // machine that has both, resolution MUST succeed — that is exactly the
+        // stock-library path this slice exists to close.
+        let has_libs = !kicad_share_dirs().is_empty();
+        let has_table = kicad_config_dir().join("fp-lib-table").is_file();
+        if !(has_libs && has_table) {
+            return;
+        }
+        let p = resolve_lib_footprint("Resistor_SMD:R_0402_1005Metric", None)
+            .expect("stock R_0402 must resolve when KiCad libs + fp-lib-table are present");
+        assert!(p.is_file(), "resolved path should be a real file: {p:?}");
+        assert_eq!(p.extension().and_then(|e| e.to_str()), Some("kicad_mod"));
+    }
 }
 
 // ─── KiCAD config directory detection ────────────────────────────────────────
@@ -570,4 +651,177 @@ fn find_kicad_symbol_dirs() -> Vec<std::path::PathBuf> {
         }
     }
     dirs
+}
+
+// ─── KiCAD footprint library resolution ──────────────────────────────────────
+
+/// Candidate `share/kicad` data roots of the installed KiCAD, highest version
+/// first. Used to synthesize the built-in `${KICAD*_*_DIR}` defaults, which
+/// KiCAD keeps internally rather than in the process environment.
+pub fn kicad_share_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    #[cfg(target_os = "windows")]
+    let candidates = [
+        r"C:\KiCad\10.0\share\kicad",
+        r"C:\Program Files\KiCad\10.0\share\kicad",
+        r"C:\KiCad\9.0\share\kicad",
+        r"C:\Program Files\KiCad\9.0\share\kicad",
+    ];
+    #[cfg(target_os = "macos")]
+    let candidates = [
+        "/Applications/KiCad/KiCad.app/Contents/SharedSupport",
+        "/Applications/KiCad.app/Contents/SharedSupport",
+        "/usr/local/share/kicad",
+    ];
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let candidates = ["/usr/share/kicad", "/usr/local/share/kicad"];
+    for c in &candidates {
+        let p = std::path::PathBuf::from(c);
+        if p.is_dir() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
+    dirs
+}
+
+/// Resolve a single `${VAR}` name to a directory string. Process environment
+/// wins; otherwise the well-known KiCAD data-dir vars fall back to the matching
+/// subdirectory of the installed `share/kicad`. Returns `None` for anything
+/// unknown, so the caller can leave the `${VAR}` in place.
+fn resolve_kicad_var(var: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(var) {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    if !var.starts_with("KICAD") {
+        return None;
+    }
+    let sub = if var.ends_with("_FOOTPRINT_DIR") {
+        "footprints"
+    } else if var.ends_with("_SYMBOL_DIR") {
+        "symbols"
+    } else if var.ends_with("_3DMODEL_DIR") {
+        "3dmodels"
+    } else if var.ends_with("_TEMPLATE_DIR") {
+        "template"
+    } else {
+        return None;
+    };
+    for share in kicad_share_dirs() {
+        let p = share.join(sub);
+        if p.is_dir() {
+            return Some(p.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    None
+}
+
+/// Expand every `${VAR}` in a KiCAD library URI (see [`resolve_kicad_var`] for
+/// the per-variable rules). Unknown or unterminated references are left verbatim
+/// so a partially-resolvable URI still round-trips.
+pub fn expand_kicad_env_vars(uri: &str) -> String {
+    let mut out = String::new();
+    let mut rest = uri;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(close) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let var = &after[..close];
+        match resolve_kicad_var(var) {
+            Some(val) => out.push_str(&val),
+            None => {
+                out.push_str("${");
+                out.push_str(var);
+                out.push('}');
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Resolve a footprint id `Nickname:Footprint` to an existing `.kicad_mod` path.
+///
+/// Walks the project `fp-lib-table` (if `project` is given) then the global one,
+/// recursing into `(type "Table")` entries — how KiCAD 9/10 pull in the standard
+/// libraries — and expanding `${KICAD*_FOOTPRINT_DIR}` URIs. Returns the first
+/// `<pretty-dir>/<Footprint>.kicad_mod` that exists on disk. Parsing goes through
+/// the S-expression parser, so it is robust to the tab indentation KiCAD writes.
+pub fn resolve_lib_footprint(
+    lib_id: &str,
+    project: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let (nick, fp_name) = lib_id.split_once(':')?;
+    if nick.is_empty() || fp_name.is_empty() {
+        return None;
+    }
+
+    let mut tables: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(proj) = project {
+        let t = proj
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("fp-lib-table");
+        if t.is_file() {
+            tables.push(t);
+        }
+    }
+    let global = kicad_config_dir().join("fp-lib-table");
+    if global.is_file() {
+        tables.push(global);
+    }
+
+    let mut visited: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    for t in &tables {
+        if let Some(dir) = resolve_nick_in_fp_table(t, nick, &mut visited) {
+            let candidate = dir.join(format!("{}.kicad_mod", fp_name));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Find the `.pretty` directory registered under `nick` in `table_path`,
+/// following `(type "Table")` includes depth-first. `visited` (canonicalized
+/// table paths) guards against include cycles.
+fn resolve_nick_in_fp_table(
+    table_path: &std::path::Path,
+    nick: &str,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let key = table_path
+        .canonicalize()
+        .unwrap_or_else(|_| table_path.to_path_buf());
+    if !visited.insert(key) {
+        return None;
+    }
+    let content = std::fs::read_to_string(table_path).ok()?;
+    let tree = konnect_sexp::parser::parse_sexp(&content).ok()?;
+
+    // Direct entries first (a matching nickname wins over descending into an
+    // included table), then recurse into nested `(type "Table")` includes.
+    let mut nested: Vec<std::path::PathBuf> = Vec::new();
+    for lib in tree.find_all("lib") {
+        let ltype = lib.find_str("type").unwrap_or("");
+        let uri = lib.find_str("uri").unwrap_or("");
+        if ltype.eq_ignore_ascii_case("Table") {
+            nested.push(std::path::PathBuf::from(expand_kicad_env_vars(uri)));
+        } else if lib.find_str("name") == Some(nick) {
+            return Some(std::path::PathBuf::from(expand_kicad_env_vars(uri)));
+        }
+    }
+    for sub in nested {
+        if let Some(dir) = resolve_nick_in_fp_table(&sub, nick, visited) {
+            return Some(dir);
+        }
+    }
+    None
 }

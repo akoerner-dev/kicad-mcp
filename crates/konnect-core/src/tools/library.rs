@@ -6,6 +6,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_str, ToolContext, ToolDef};
+use konnect_sexp::parser::{parse_sexp, SexpNode};
 use konnect_sexp::writer::write_atomic;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -238,11 +239,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_footprint_info",
-            "Return detailed information about a footprint: pad layout, courtyard, description.",
+            "Return detailed information about a footprint: full pad geometry (padstacks), courtyard bbox, attr, 3D model, description. Resolves 'Library:Footprint' via the fp-lib-table (expands ${KICAD*_FOOTPRINT_DIR} and follows nested standard-library tables).",
             json!({
                 "type": "object",
                 "properties": {
-                    "footprint_path": { "type": "string", "description": "Path to .kicad_mod file, OR 'Library:Footprint' identifier" }
+                    "footprint_path": { "type": "string", "description": "Path to .kicad_mod file, OR 'Library:Footprint' identifier" },
+                    "project": { "type": "string", "description": "Optional path to a .kicad_pro/.kicad_pcb to also consult the project fp-lib-table when resolving a 'Library:Footprint' id" }
                 },
                 "required": ["footprint_path"]
             }),
@@ -775,45 +777,25 @@ fn global_sym_lib_table() -> PathBuf {
     super::kicad_config_dir().join("sym-lib-table")
 }
 
-/// Parse a lib-table S-expression and return list of (nickname, uri, type) tuples.
+/// Parse a lib-table into `{nickname, uri, type, description}` objects. Goes
+/// through the S-expression parser, so it is robust to the tab indentation KiCad
+/// writes — a substring scan for `"\n  (lib "` (two spaces) parsed real KiCad
+/// tables as empty, since KiCad indents entries with a tab.
 fn parse_lib_table(content: &str) -> Vec<serde_json::Value> {
-    let mut libs = Vec::new();
-    // Each entry: (lib (name "NICK") (type "...") (uri "...") (options "") (descr "..."))
-    let mut pos = 0;
-    while let Some(lib_start) = content[pos..].find("\n  (lib ").map(|i| pos + i) {
-        // Find the end of this lib block
-        let inner_start = lib_start + 2; // skip "\n  "
-        let mut depth = 0i32;
-        let mut end = inner_start;
-        for (i, ch) in content[inner_start..].char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = inner_start + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let block = &content[inner_start..end];
-
-        let nickname = extract_sexp_string(block, "name").unwrap_or_default();
-        let uri = extract_sexp_string(block, "uri").unwrap_or_default();
-        let lib_type = extract_sexp_string(block, "type").unwrap_or_default();
-        let descr = extract_sexp_string(block, "descr").unwrap_or_default();
-
-        libs.push(json!({
-            "nickname": nickname,
-            "uri": uri,
-            "type": lib_type,
-            "description": descr
-        }));
-        pos = end;
-    }
-    libs
+    let Ok(tree) = parse_sexp(content) else {
+        return Vec::new();
+    };
+    tree.find_all("lib")
+        .into_iter()
+        .map(|lib| {
+            json!({
+                "nickname": lib.find_str("name").unwrap_or_default(),
+                "uri": lib.find_str("uri").unwrap_or_default(),
+                "type": lib.find_str("type").unwrap_or_default(),
+                "description": lib.find_str("descr").unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 /// Extract a quoted string value from `(key "value")` within a block.
@@ -1400,6 +1382,166 @@ async fn handle_list_library_footprints(
     ))
 }
 
+// ─── Footprint geometry reader (parse an existing .kicad_mod) ─────────────────
+
+/// A pad read from a `.kicad_mod`, carrying the full padstack needed to place it
+/// on a board.
+#[derive(Debug, Clone)]
+pub struct FpPad {
+    pub number: String,
+    pub pad_type: String,
+    pub shape: String,
+    pub x: f64,
+    pub y: f64,
+    pub rot: Option<f64>,
+    pub w: f64,
+    pub h: f64,
+    pub layers: Vec<String>,
+    pub drill: Option<f64>,
+    pub roundrect_rratio: Option<f64>,
+}
+
+/// A footprint parsed from a library `.kicad_mod` file — the geometry needed to
+/// display it and (later) place it on a board.
+#[derive(Debug, Clone)]
+pub struct LibFootprint {
+    pub name: String,
+    pub descr: String,
+    pub attr: String,
+    pub pads: Vec<FpPad>,
+    /// Courtyard bbox `(min_x, min_y, max_x, max_y)`, unioned over F/B.CrtYd graphics.
+    pub courtyard: Option<(f64, f64, f64, f64)>,
+    pub model_path: Option<String>,
+}
+
+/// The `(x, y)` of a coordinate node like `(start X Y)` or `(xy X Y)`.
+fn xy_of(n: &SexpNode) -> Option<(f64, f64)> {
+    let x = n.get(1)?.as_str()?.parse().ok()?;
+    let y = n.get(2)?.as_str()?.parse().ok()?;
+    Some((x, y))
+}
+
+fn is_courtyard_layer(layer: &str) -> bool {
+    layer == "F.CrtYd" || layer == "B.CrtYd"
+}
+
+/// Fold a graphics node's start/end/center points and any `(pts (xy ..) ..)`
+/// into the running bbox `bb = (min_x, min_y, max_x, max_y)`.
+fn accumulate_bbox(node: &SexpNode, bb: &mut (f64, f64, f64, f64)) {
+    let mut push = |x: f64, y: f64| {
+        bb.0 = bb.0.min(x);
+        bb.1 = bb.1.min(y);
+        bb.2 = bb.2.max(x);
+        bb.3 = bb.3.max(y);
+    };
+    for tag in ["start", "end", "center"] {
+        if let Some((x, y)) = node.find(tag).and_then(xy_of) {
+            push(x, y);
+        }
+    }
+    if let Some(pts) = node.find("pts") {
+        for xy in pts.find_all("xy") {
+            if let Some((x, y)) = xy_of(xy) {
+                push(x, y);
+            }
+        }
+    }
+}
+
+/// Courtyard bounding box unioned over all F/B.CrtYd graphics, or `None`.
+fn courtyard_bbox(fp: &SexpNode) -> Option<(f64, f64, f64, f64)> {
+    let mut bb = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for tag in ["fp_rect", "fp_line", "fp_poly", "fp_circle"] {
+        for g in fp.find_all(tag) {
+            if g.find_str("layer").is_some_and(is_courtyard_layer) {
+                accumulate_bbox(g, &mut bb);
+            }
+        }
+    }
+    (bb.0.is_finite() && bb.2 > bb.0 && bb.3 > bb.1).then_some(bb)
+}
+
+/// Parse a `.kicad_mod` (or a board-embedded `(footprint ...)`) into geometry.
+pub fn parse_lib_footprint(content: &str) -> anyhow::Result<LibFootprint> {
+    let tree = parse_sexp(content)?;
+    let fp = if tree.head() == Some("footprint") {
+        &tree
+    } else {
+        tree.find("footprint")
+            .ok_or_else(|| anyhow::anyhow!("no (footprint ...) node found"))?
+    };
+
+    let name = fp.get(1).and_then(|n| n.as_str()).unwrap_or("").to_string();
+    let descr = fp.find_str("descr").unwrap_or("").to_string();
+    let attr = fp.find_str("attr").unwrap_or("").to_string();
+    let model_path = fp
+        .find("model")
+        .and_then(|m| m.get(1))
+        .and_then(|n| n.as_str())
+        .map(String::from);
+
+    let mut pads = Vec::new();
+    for p in fp.find_all("pad") {
+        let Some(number) = p.get(1).and_then(|n| n.as_str()).map(String::from) else {
+            continue;
+        };
+        let pad_type = p.get(2).and_then(|n| n.as_str()).unwrap_or("").to_string();
+        let shape = p.get(3).and_then(|n| n.as_str()).unwrap_or("").to_string();
+        let at = p.find("at");
+        let x = at.and_then(|a| a.get_f64(1)).unwrap_or(0.0);
+        let y = at.and_then(|a| a.get_f64(2)).unwrap_or(0.0);
+        let rot = at.and_then(|a| a.get_f64(3));
+        let size = p.find("size");
+        let w = size.and_then(|s| s.get_f64(1)).unwrap_or(0.0);
+        let h = size.and_then(|s| s.get_f64(2)).unwrap_or(0.0);
+        let layers = p
+            .find("layers")
+            .and_then(|l| l.children())
+            .map(|c| {
+                c.iter()
+                    .skip(1)
+                    .filter_map(|n| n.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // `(drill D)` or `(drill oval DX DY)` — first numeric child.
+        let drill = p.find("drill").and_then(|d| {
+            d.children()?
+                .iter()
+                .skip(1)
+                .find_map(|n| n.as_str()?.parse::<f64>().ok())
+        });
+        let roundrect_rratio = p.find_f64("roundrect_rratio");
+        pads.push(FpPad {
+            number,
+            pad_type,
+            shape,
+            x,
+            y,
+            rot,
+            w,
+            h,
+            layers,
+            drill,
+            roundrect_rratio,
+        });
+    }
+
+    Ok(LibFootprint {
+        name,
+        descr,
+        attr,
+        pads,
+        courtyard: courtyard_bbox(fp),
+        model_path,
+    })
+}
+
 async fn handle_get_footprint_info(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1407,56 +1549,70 @@ async fn handle_get_footprint_info(
     let fp_path_str =
         require_str(args, "footprint_path").map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
-    // Resolve "Library:Footprint" form via global fp-lib-table
-    let path =
-        if fp_path_str.contains(':') && !fp_path_str.contains('/') && !fp_path_str.contains('\\') {
-            let parts: Vec<&str> = fp_path_str.splitn(2, ':').collect();
-            let (nick, fp_name) = (parts[0], parts[1]);
-            let table = global_fp_lib_table();
-            if table.exists() {
-                let tc = tokio::fs::read_to_string(&table).await?;
-                let libs = parse_lib_table(&tc);
-                if let Some(lib) = libs.iter().find(|l| l["nickname"].as_str() == Some(nick)) {
-                    let uri = lib["uri"].as_str().unwrap_or("");
-                    PathBuf::from(uri).join(format!("{}.kicad_mod", fp_name))
-                } else {
-                    return Ok(CallToolResult::error(format!(
-                        "Library '{}' not found in fp-lib-table",
-                        nick
-                    )));
-                }
-            } else {
-                return Ok(CallToolResult::error("Global fp-lib-table not found"));
+    // Resolve "Library:Footprint" through the fp-lib-table (env-var expansion +
+    // nested `(type "Table")` includes); anything with a path separator is taken
+    // as a direct file path.
+    let path = if fp_path_str.contains(':')
+        && !fp_path_str.contains('/')
+        && !fp_path_str.contains('\\')
+    {
+        let project = args["project"].as_str().map(Path::new);
+        match super::resolve_lib_footprint(fp_path_str, project) {
+            Some(p) => p,
+            None => {
+                return Ok(CallToolResult::error(format!(
+                    "Footprint '{}' not resolvable via any fp-lib-table",
+                    fp_path_str
+                )))
             }
-        } else {
-            PathBuf::from(fp_path_str)
-        };
+        }
+    } else {
+        PathBuf::from(fp_path_str)
+    };
 
     let content = tokio::fs::read_to_string(&path).await?;
+    let fp = match parse_lib_footprint(&content) {
+        Ok(f) => f,
+        Err(e) => return Ok(CallToolResult::error(format!("Failed to parse footprint: {e}"))),
+    };
 
-    // Parse basic info: description, pads
-    let description = extract_sexp_string(&content, "descr").unwrap_or_default();
-    let fp_name = extract_sexp_string(&content, "footprint").unwrap_or_else(|| {
-        path.file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
+    let pads: Vec<_> = fp
+        .pads
+        .iter()
+        .map(|p| {
+            json!({
+                "number": p.number,
+                "type": p.pad_type,
+                "shape": p.shape,
+                "x": p.x,
+                "y": p.y,
+                "rot": p.rot,
+                "width": p.w,
+                "height": p.h,
+                "layers": p.layers,
+                "drill": p.drill,
+                "roundrect_rratio": p.roundrect_rratio,
+            })
+        })
+        .collect();
+    let courtyard = fp.courtyard.map(|(min_x, min_y, max_x, max_y)| {
+        json!({
+            "min_x": min_x, "min_y": min_y, "max_x": max_x, "max_y": max_y,
+            "width": max_x - min_x, "height": max_y - min_y
+        })
     });
-
-    // Count pads
-    let pad_count = content.matches("\n  (pad ").count();
-
-    // Extract courtyard bbox (gr_poly on B.CrtYd or F.CrtYd) — simplified
-    let has_courtyard = content.contains("B.CrtYd") || content.contains("F.CrtYd");
-    let has_3d = content.contains("(model ");
 
     Ok(CallToolResult::text(
         serde_json::to_string_pretty(&json!({
-            "name": fp_name,
-            "description": description,
-            "pad_count": pad_count,
-            "has_courtyard": has_courtyard,
-            "has_3d_model": has_3d,
+            "name": fp.name,
+            "description": fp.descr,
+            "attr": fp.attr,
+            "pad_count": fp.pads.len(),
+            "pads": pads,
+            "courtyard": courtyard,
+            "has_courtyard": fp.courtyard.is_some(),
+            "has_3d_model": fp.model_path.is_some(),
+            "model": fp.model_path,
             "path": path.to_str().unwrap_or("")
         }))
         .unwrap(),
@@ -1472,63 +1628,42 @@ async fn handle_search_footprints(
     let query = args["query"].as_str().unwrap_or("").to_lowercase();
     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
-    // Walk global fp-lib-table
+    // Walk the global fp-lib-table (tab-robust via parse_lib_table), expanding
+    // ${KICAD*_DIR} URIs so classic env-var library entries are searchable.
     let fp_lib_table_path = super::kicad_config_dir().join("fp-lib-table");
 
     let mut results = Vec::new();
 
     if fp_lib_table_path.exists() {
         let tc = tokio::fs::read_to_string(&fp_lib_table_path).await?;
-
-        // Parse lib entries
-        let mut search = tc.as_str();
-        'outer: while let Some(lib_pos) = search.find("\n  (lib ") {
-            let block_start = lib_pos + 3;
-            let mut depth = 0i32;
-            let mut block_end = block_start;
-            for (i, ch) in search[block_start..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            block_end = block_start + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
+        'outer: for lib in parse_lib_table(&tc) {
+            let nickname = lib["nickname"].as_str().unwrap_or("");
+            let uri = super::expand_kicad_env_vars(lib["uri"].as_str().unwrap_or(""));
+            if uri.contains("${") {
+                continue; // still-unresolved variable
             }
-            let block = &search[block_start..block_end];
-            let nickname = extract_sexp_string(block, "name").unwrap_or_default();
-            let uri = extract_sexp_string(block, "uri").unwrap_or_default();
-
-            if !uri.starts_with("${") {
-                let dir = PathBuf::from(uri);
-                if dir.is_dir() {
-                    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
-                        while let Ok(Some(entry)) = rd.next_entry().await {
-                            let fname = entry.file_name();
-                            let fname_str = fname.to_string_lossy();
-                            if fname_str.ends_with(".kicad_mod") {
-                                let fp_name = fname_str.trim_end_matches(".kicad_mod");
-                                if fp_name.to_lowercase().contains(&query) {
-                                    results.push(json!({
-                                        "library": nickname,
-                                        "name": fp_name,
-                                        "id": format!("{}:{}", nickname, fp_name)
-                                    }));
-                                    if results.len() >= limit {
-                                        break 'outer;
-                                    }
-                                }
+            let dir = PathBuf::from(&uri);
+            if !dir.is_dir() {
+                continue; // (type "Table") includes point at a file, not a dir
+            }
+            if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+                while let Ok(Some(entry)) = rd.next_entry().await {
+                    let fname = entry.file_name();
+                    let fname_str = fname.to_string_lossy();
+                    if let Some(fp_name) = fname_str.strip_suffix(".kicad_mod") {
+                        if fp_name.to_lowercase().contains(&query) {
+                            results.push(json!({
+                                "library": nickname,
+                                "name": fp_name,
+                                "id": format!("{}:{}", nickname, fp_name)
+                            }));
+                            if results.len() >= limit {
+                                break 'outer;
                             }
                         }
                     }
                 }
             }
-
-            search = &search[lib_pos + 1..];
         }
     }
 
@@ -1932,5 +2067,67 @@ mod tests {
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "generated symbol doesn't parse"
         );
+    }
+
+    // A faithful (trimmed) KiCad 10 stock footprint, tab-indented as on disk.
+    const R_0402: &str = "(footprint \"R_0402_1005Metric\"\n\t(version 20260206)\n\t(generator \"kicad-footprint-generator\")\n\t(layer \"F.Cu\")\n\t(descr \"Resistor SMD 0402 (1005 Metric)\")\n\t(attr smd)\n\t(fp_rect\n\t\t(start -0.93 -0.47)\n\t\t(end 0.93 0.47)\n\t\t(stroke (width 0.05) (type solid))\n\t\t(fill no)\n\t\t(layer \"F.CrtYd\")\n\t)\n\t(pad \"1\" smd roundrect\n\t\t(at -0.51 0)\n\t\t(size 0.54 0.64)\n\t\t(layers \"F.Cu\" \"F.Mask\" \"F.Paste\")\n\t\t(roundrect_rratio 0.25)\n\t)\n\t(pad \"2\" smd roundrect\n\t\t(at 0.51 0)\n\t\t(size 0.54 0.64)\n\t\t(layers \"F.Cu\" \"F.Mask\" \"F.Paste\")\n\t\t(roundrect_rratio 0.25)\n\t)\n\t(model \"${KICAD10_3DMODEL_DIR}/Resistor_SMD.3dshapes/R_0402_1005Metric.step\"\n\t\t(offset (xyz 0 0 0))\n\t\t(scale (xyz 1 1 1))\n\t\t(rotate (xyz 0 0 0))\n\t)\n)";
+
+    #[test]
+    fn parse_lib_footprint_reads_full_padstack() {
+        let fp = parse_lib_footprint(R_0402).expect("parses");
+        assert_eq!(fp.name, "R_0402_1005Metric");
+        assert_eq!(fp.attr, "smd");
+        assert!(fp.descr.contains("Resistor"));
+        assert_eq!(fp.pads.len(), 2);
+
+        let p1 = &fp.pads[0];
+        assert_eq!(p1.number, "1");
+        assert_eq!(p1.pad_type, "smd");
+        assert_eq!(p1.shape, "roundrect");
+        assert!((p1.x - -0.51).abs() < 1e-9 && p1.y.abs() < 1e-9);
+        assert!((p1.w - 0.54).abs() < 1e-9 && (p1.h - 0.64).abs() < 1e-9);
+        assert_eq!(p1.layers, ["F.Cu", "F.Mask", "F.Paste"]);
+        assert_eq!(p1.roundrect_rratio, Some(0.25));
+        assert_eq!(p1.drill, None);
+
+        // Courtyard bbox unions the F.CrtYd rectangle.
+        let (a, b, c, d) = fp.courtyard.expect("has courtyard");
+        assert!((a - -0.93).abs() < 1e-9 && (b - -0.47).abs() < 1e-9);
+        assert!((c - 0.93).abs() < 1e-9 && (d - 0.47).abs() < 1e-9);
+
+        assert_eq!(
+            fp.model_path.as_deref(),
+            Some("${KICAD10_3DMODEL_DIR}/Resistor_SMD.3dshapes/R_0402_1005Metric.step")
+        );
+    }
+
+    #[test]
+    fn parse_lib_footprint_reads_through_hole_drill() {
+        let round = "(footprint \"C1\" (attr through_hole) (pad \"1\" thru_hole circle (at 0 0) (size 1.6 1.6) (drill 0.8) (layers \"*.Cu\" \"*.Mask\")))";
+        let fp = parse_lib_footprint(round).expect("parses");
+        assert_eq!(fp.pads[0].pad_type, "thru_hole");
+        assert_eq!(fp.pads[0].drill, Some(0.8));
+        assert_eq!(fp.pads[0].layers, ["*.Cu", "*.Mask"]);
+        // Oval drill: first numeric child is the drill size.
+        let oval = "(footprint \"C2\" (pad \"1\" thru_hole oval (at 0 0) (size 2 3) (drill oval 0.8 1.0) (layers \"*.Cu\")))";
+        let fp2 = parse_lib_footprint(oval).expect("parses");
+        assert_eq!(fp2.pads[0].drill, Some(0.8));
+        // No courtyard graphics → None.
+        assert!(fp2.courtyard.is_none());
+    }
+
+    #[test]
+    fn parse_lib_table_reads_tab_indented_table() {
+        // KiCad writes lib-tables tab-indented; the old two-space substring scan
+        // parsed these as empty. The parser-based version must find both entries.
+        let table = "(fp_lib_table\n\t(version 7)\n\t(lib (name \"Device\") (type \"KiCad\") (uri \"${KICAD10_FOOTPRINT_DIR}/Device.pretty\") (options \"\") (descr \"std\"))\n\t(lib (name \"Custom\") (type \"KiCad\") (uri \"C:/x/Custom.pretty\") (options \"\") (descr \"\"))\n)";
+        let libs = parse_lib_table(table);
+        assert_eq!(libs.len(), 2, "tab-indented table must parse both libs");
+        assert_eq!(libs[0]["nickname"], "Device");
+        assert_eq!(libs[0]["uri"], "${KICAD10_FOOTPRINT_DIR}/Device.pretty");
+        assert_eq!(libs[0]["type"], "KiCad");
+        assert_eq!(libs[1]["nickname"], "Custom");
+        // An empty / malformed table yields no entries rather than panicking.
+        assert!(parse_lib_table("").is_empty());
     }
 }
