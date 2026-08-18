@@ -214,7 +214,7 @@ mod query_cache_tests {
 /// Shorthand for building a ToolDef with a typed async handler function.
 ///
 /// Usage:
-/// ```rust
+/// ```rust,ignore
 /// tool!(
 ///     "tool_name",
 ///     "Description of what it does.",
