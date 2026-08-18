@@ -211,7 +211,12 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_active_layer",
-            "Set the active layer recorded in the board file's setup section.",
+            "[DISABLED - do not use] Formerly wrote an (active_layer ...) token into the board \
+             (setup) section, but that token is invalid there: KiCad 10 still loads such a board, \
+             then crashes with an access violation on the next save; it now refuses with an error \
+             and changes nothing. The active layer is editor UI state stored in the project's \
+             <name>.kicad_prl file as an integer layer index, never in the .kicad_pcb. To place \
+             items on a given layer, pass that layer explicitly to the tool that creates each item.",
             json!({
                 "type": "object",
                 "properties": {
@@ -584,41 +589,29 @@ async fn handle_add_layer(
 }
 
 async fn handle_set_active_layer(
-    args: &serde_json::Value,
+    _args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
-    let layer = match require_str(args, "layer") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-
-    let content = std::fs::read_to_string(&board_path)?;
-    let new_content = if let Some(pos) = content.find("(active_layer ") {
-        let after = pos + "(active_layer ".len();
-        let close = content[after..].find(')').unwrap_or(0);
-        let layer_end = after + close;
-        apply_edits(
-            content,
-            vec![SexpEdit::replace(after, layer_end, format!("\"{layer}\""))],
-        )
-    } else {
-        // Insert into setup block
-        let setup_close = content
-            .find("(setup")
-            .and_then(|p| content[p..].find('\n').map(|off| p + off))
-            .unwrap_or(content.rfind(')').unwrap_or(content.len()));
-        apply_edits(
-            content,
-            vec![SexpEdit::insert(
-                setup_close,
-                format!("\n    (active_layer \"{layer}\")"),
-            )],
-        )
-    };
-    write_atomic(&board_path, &new_content)?;
-
-    Ok(CallToolResult::json(&json!({ "active_layer": layer })))
+    // GUARD (2026-08-18): this handler is intentionally inert.
+    //
+    // It used to write an `(active_layer "<layer>")` token into the board's
+    // `(setup ...)` section. That token is invalid there: KiCAD 10 still LOADS
+    // such a board, but crashes with an access violation (0xC0000005) the next
+    // time it SAVES it — confirmed against KiCAD 10.0.1 by round-tripping a real
+    // board through pcbnew LoadBoard+SaveBoard (2026-08-18). The active layer is
+    // editor/UI state that KiCAD stores in the sibling `<project>.kicad_prl` file
+    // as an integer layer index (e.g. `"active_layer": 0`), never in the
+    // `.kicad_pcb`. Refuse rather than touch the file, so no caller can plant this
+    // latent crash. See ROADMAP.md "Known gaps".
+    Ok(CallToolResult::error(
+        "set_active_layer is disabled: it wrote an (active_layer ...) token into \
+         the .kicad_pcb (setup) section, which is not valid there and makes KiCad \
+         crash (access violation) on the next save. The active layer is editor UI \
+         state stored in the project's <name>.kicad_prl file as an integer layer \
+         index, not in the board; this tool does not write that file. To place \
+         items on a specific layer, pass the layer explicitly to the tool that \
+         creates each item.",
+    ))
 }
 
 async fn handle_add_board_outline(
@@ -974,5 +967,69 @@ mod svg_logo_tests {
 
         let result = handle_import_svg_logo(&args, &ctx).await.unwrap();
         assert!(result.is_error);
+    }
+}
+
+#[cfg(test)]
+mod set_active_layer_guard_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// Core safety property: the guard must never again mutate the board. It used
+    /// to splice an invalid `(active_layer ...)` token into `(setup ...)`, which
+    /// made KiCAD 10 crash with an access violation on the next save. Assert the
+    /// `.kicad_pcb` is byte-for-byte unchanged and the call is flagged is_error,
+    /// so no caller assumes the active layer was set.
+    #[tokio::test]
+    async fn refuses_and_leaves_board_byte_for_byte_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        let original = "(kicad_pcb (setup (pad_to_mask_clearance 0)))";
+        std::fs::write(&board, original).unwrap();
+
+        let args = json!({ "board": board.to_str().unwrap(), "layer": "F.Cu" });
+        let result = handle_set_active_layer(&args, &ctx()).await.unwrap();
+
+        assert!(result.is_error, "guarded tool must report is_error");
+        let after = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(after, original, "board file must be byte-for-byte unchanged");
+        assert!(
+            !after.contains("active_layer"),
+            "no (active_layer) token may be inserted into setup"
+        );
+    }
+
+    /// The refusal message must keep naming the correct mechanism (.kicad_prl) and
+    /// flag that the tool is disabled, so the guidance survives future edits.
+    #[tokio::test]
+    async fn error_message_names_the_correct_mechanism() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (setup))").unwrap();
+
+        let args = json!({ "board": board.to_str().unwrap(), "layer": "F.Cu" });
+        let result = handle_set_active_layer(&args, &ctx()).await.unwrap();
+
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(text.contains(".kicad_prl"), "must name the correct file: {text}");
+        assert!(text.contains("disabled"), "must state it is disabled: {text}");
     }
 }

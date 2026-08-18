@@ -44,6 +44,12 @@ currently promise more than their handlers deliver.
   board — so the handler now refuses with an error instead of writing. A real
   implementation must target the sibling `<project>.kicad_dru` file; per-board
   minimums already work via `set_design_rules`.
+- **`set_active_layer`** is now guarded: it used to write an `(active_layer …)` token
+  into the `.kicad_pcb` `(setup …)` section — invalid there. KiCAD 10 loads such a
+  board but crashes with an access violation on the next save (confirmed against
+  KiCAD 10.0.1 on 2026-08-18), so the handler now refuses instead of writing. The
+  active layer is editor UI state stored in `<project>.kicad_prl` as an integer layer
+  index, never in the board.
 - **`move_connected`** delegates to the plain move; connected wires do not stretch.
 - **`annotate_schematic`** rewrites `?` only in the instance path, not in the
   visible `(property "Reference" …)`, so other tools still find the part as `R?`.

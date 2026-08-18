@@ -191,7 +191,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_board_extents` | Return the bounding box of all objects on the board (IPC, falls back to file parse). |
 | `get_layer_list` | Return all layers defined in the board with names and types. |
 | `add_layer` | Add a new inner copper or technical layer to the board stack. |
-| `set_active_layer` | Set the active layer recorded in the board file's setup section. |
+| `set_active_layer` | **Disabled** — formerly wrote an `(active_layer …)` token into the board `(setup)` section, which is invalid there: KiCad 10 loads the board but crashes with an access violation on the next save; now refuses with an error. The active layer is editor UI state in `<project>.kicad_prl` (integer layer index), not the board; pass the target layer explicitly to the tool that creates each item. |
 | `add_board_outline` | Add a rectangular board outline on the Edge.Cuts layer at specified coordinates. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
